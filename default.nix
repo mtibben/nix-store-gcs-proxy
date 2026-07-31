@@ -6,7 +6,7 @@ pkgs.buildGoModule {
   pname = "nix-store-gcs-proxy";
   version = "0.1.0";
   src = ./.;
-  vendorHash = "sha256-lv6fpN0xCcDBUhqSvpLfBChHUOmHylappiNGRKQ+hvI=";
+  vendorHash = "sha256-RTaTYe/sBcpK3v6eMEc9DnpGdy+bRZP+lrkl12q0P8I=";
 
   nativeCheckInputs = [ pkgs.golangci-lint ];
   checkPhase = ''

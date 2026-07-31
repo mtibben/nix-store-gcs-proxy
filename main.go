@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 	"google.golang.org/api/option"
 )
 
@@ -113,8 +113,8 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // Start the HTTP server
-func run(addr, bucketName string) (runErr error) {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
+	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	client, err := storage.NewClient(ctx, option.WithScopes(storage.ScopeReadWrite))
@@ -177,34 +177,35 @@ func run(addr, bucketName string) (runErr error) {
 }
 
 // Urfave cli action
-func action(c *cli.Context) error {
+func action(ctx context.Context, c *cli.Command) error {
 	addr := c.String("addr")
 	bucketName := c.String("bucket-name")
 	if bucketName == "" {
 		return errBucketNameRequired
 	}
-	return run(addr, bucketName)
+	return run(ctx, addr, bucketName)
 }
 
 func main() {
-	app := cli.NewApp()
-	app.Name = "nix-store-gcs-proxy"
-	app.Usage = "A HTTP nix store that proxies requests to Google Storage"
-	app.Version = "0.0.1"
-	app.Action = action
-	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "bucket-name",
-			Usage: "name of the bucket to proxy the data to",
-		},
-		cli.StringFlag{
-			Name:  "addr",
-			Value: "localhost:3000",
-			Usage: "listening address of the HTTP server",
+	app := &cli.Command{
+		Name:    "nix-store-gcs-proxy",
+		Usage:   "A HTTP nix store that proxies requests to Google Storage",
+		Version: "0.0.1",
+		Action:  action,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "bucket-name",
+				Usage: "name of the bucket to proxy the data to",
+			},
+			&cli.StringFlag{
+				Name:  "addr",
+				Value: "localhost:3000",
+				Usage: "listening address of the HTTP server",
+			},
 		},
 	}
 
-	err := app.Run(os.Args)
+	err := app.Run(context.Background(), os.Args)
 	if err != nil {
 		log.Fatal(err)
 	}
