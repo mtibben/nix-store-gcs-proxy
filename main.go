@@ -298,7 +298,10 @@ func uploadChunkSize(contentLength int64) int {
 }
 
 // Start the HTTP server
-func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
+func run(
+	parentCtx context.Context,
+	addr, bucketName, buildVersion string,
+) (runErr error) {
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -333,7 +336,7 @@ func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
 		serverErr <- server.ListenAndServe()
 	}()
 
-	log.Printf("Starting proxy server on address %s for bucket %s", addr, bucketName)
+	log.Print(startupLogMessage(buildVersion, addr, bucketName))
 
 	select {
 	case err := <-serverErr:
@@ -365,14 +368,23 @@ func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
 	return nil
 }
 
-// Urfave cli action
-func action(ctx context.Context, c *cli.Command) error {
+func startupLogMessage(buildVersion, addr, bucketName string) string {
+	return fmt.Sprintf(
+		"Starting nix-store-gcs-proxy version %s on address %s for bucket %s",
+		buildVersion,
+		addr,
+		bucketName,
+	)
+}
+
+// Urfave CLI action.
+func action(ctx context.Context, c *cli.Command, buildVersion string) error {
 	addr := c.String("addr")
 	bucketName := c.String("bucket-name")
 	if bucketName == "" {
 		return errBucketNameRequired
 	}
-	return run(ctx, addr, bucketName)
+	return run(ctx, addr, bucketName, buildVersion)
 }
 
 func newCommand(buildVersion string) *cli.Command {
@@ -380,7 +392,9 @@ func newCommand(buildVersion string) *cli.Command {
 		Name:    "nix-store-gcs-proxy",
 		Usage:   "A HTTP nix store that proxies requests to Google Storage",
 		Version: buildVersion,
-		Action:  action,
+		Action: func(ctx context.Context, c *cli.Command) error {
+			return action(ctx, c, buildVersion)
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "bucket-name",

@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduce memory used by concurrent small uploads while retaining resumable
   16 MiB chunks for large and unknown-size objects.
 - Coalesce bursts of GCS-backed readiness checks with a one-second result cache.
+- Log the build version when the proxy server starts.
 - Modernize the Nix build and document current flake, upload, cache-consumer,
   health-check, and localhost-first performance workflows.
 
