@@ -35,8 +35,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		_, err := object.Attrs(ctx)
 		if err != nil {
 			if err == storage.ErrObjectNotExist {
-				w.WriteHeader(http.StatusNotFound)
-				fmt.Fprintf(w, "File not found")
+				http.Error(w, "File not found", http.StatusNotFound)
 			} else {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 			}
@@ -46,16 +45,21 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		rc, err := object.NewReader(ctx)
 		if err != nil {
 			if err == storage.ErrObjectNotExist {
-				w.WriteHeader(http.StatusNotFound)
-				fmt.Fprintf(w, "File not found")
+				http.Error(w, "File not found", http.StatusNotFound)
 			} else {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 			}
 			return
 		}
-		defer rc.Close()
+		defer func() {
+			if err := rc.Close(); err != nil {
+				log.Println(err)
+			}
+		}()
 
-		io.Copy(w, rc)
+		if _, err := io.Copy(w, rc); err != nil {
+			log.Println(err)
+		}
 	case http.MethodPut:
 		// Write the object to GCS
 		wc := object.NewWriter(ctx)
@@ -88,7 +92,9 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		fmt.Fprintf(w, "OK")
+		if _, err := fmt.Fprint(w, "OK"); err != nil {
+			log.Println(err)
+		}
 	default:
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
