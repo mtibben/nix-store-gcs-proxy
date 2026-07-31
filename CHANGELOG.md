@@ -1,3 +1,17 @@
+Unreleased
+==========
+
+  * add `/livez` and GCS-backed `/readyz` health-check endpoints
+  * add a Nix flake with a package, development shell, formatter, and checks
+  * update to Go 1.26.5 and refresh all Go dependencies, including urfave/cli v3
+  * replace Negroni with the standard library HTTP server
+  * add golangci-lint and strengthen checks for error handling, error wrapping,
+    context propagation, and resource cleanup
+  * harden the HTTP server with timeouts, signal handling, graceful shutdown,
+    and wrapped lifecycle errors
+  * modernize the Nix build and document current flake, upload, cache-consumer,
+    and health-check workflows
+
 
 0.1.0 / 2019-09-04
 ==================
