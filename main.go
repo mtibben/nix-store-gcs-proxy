@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -96,14 +95,14 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				w.WriteHeader(http.StatusPartialContent)
 			}
 		}
-		if _, err := io.Copy(w, object.body); err != nil {
+		if _, err := copyStream(w, object.body); err != nil {
 			log.Println(err)
 		}
 	case http.MethodPut:
 		// Write the object to GCS
 		wc := s.store.newWriter(ctx, objectPath, writeOptionsFromRequest(req))
 
-		if _, err := io.Copy(wc, req.Body); err != nil {
+		if _, err := copyStream(wc, req.Body); err != nil {
 			wc.abort()
 			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
 			log.Println(uploadErr)

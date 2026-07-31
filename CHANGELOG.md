@@ -12,6 +12,7 @@ Unreleased
   * preserve GCS response metadata and validators, and support byte-range and
     conditional cache reads
   * avoid a separate GCS metadata request when an `If-Range` validator matches
+  * reuse stream-copy buffers instead of allocating 32 KiB for every object
   * reduce memory used by concurrent small uploads while retaining resumable
     16 MiB chunks for large and unknown-size objects
   * abort failed streaming uploads instead of finalizing partial GCS objects
