@@ -13,6 +13,7 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
+      version = if self ? rev then "git-${builtins.substring 0 12 self.rev}" else "dev";
     in
     {
       checks = forAllSystems (system: {
@@ -42,7 +43,7 @@
           pkgs = nixpkgsFor.${system};
         in
         {
-          default = pkgs.callPackage ./default.nix { };
+          default = pkgs.callPackage ./default.nix { inherit version; };
         }
       );
     };

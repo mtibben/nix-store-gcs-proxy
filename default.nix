@@ -1,12 +1,14 @@
 {
   pkgs ? import <nixpkgs> { },
+  version ? "dev",
 }:
 
 pkgs.buildGoModule {
   pname = "nix-store-gcs-proxy";
-  version = "0.1.0";
+  inherit version;
   src = ./.;
   vendorHash = "sha256-RTaTYe/sBcpK3v6eMEc9DnpGdy+bRZP+lrkl12q0P8I=";
+  ldflags = [ "-X main.version=${version}" ];
 
   nativeCheckInputs = [ pkgs.golangci-lint ];
   checkPhase = ''

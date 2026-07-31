@@ -22,7 +22,10 @@ const (
 	serverShutdownTimeout   = 10 * time.Second
 )
 
-var errBucketNameRequired = errors.New("please specify a bucket name")
+var (
+	version               = "dev"
+	errBucketNameRequired = errors.New("please specify a bucket name")
+)
 
 type BucketProxy struct {
 	store objectStore
@@ -301,11 +304,11 @@ func action(ctx context.Context, c *cli.Command) error {
 	return run(ctx, addr, bucketName)
 }
 
-func main() {
-	app := &cli.Command{
+func newCommand(buildVersion string) *cli.Command {
+	return &cli.Command{
 		Name:    "nix-store-gcs-proxy",
 		Usage:   "A HTTP nix store that proxies requests to Google Storage",
-		Version: "0.0.1",
+		Version: buildVersion,
 		Action:  action,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -319,7 +322,10 @@ func main() {
 			},
 		},
 	}
+}
 
+func main() {
+	app := newCommand(version)
 	err := app.Run(context.Background(), os.Args)
 	if err != nil {
 		log.Fatal(err)

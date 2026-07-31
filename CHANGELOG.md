@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Update to Go 1.26.5 and refresh all Go dependencies, including urfave/cli v3.
+- Derive clean Nix flake build versions from the Git revision, with `dev` as
+  the default for other builds.
 - Replace Negroni with the standard library HTTP server.
 - Harden the HTTP server with timeouts, signal handling, graceful shutdown, and
   wrapped lifecycle errors.
