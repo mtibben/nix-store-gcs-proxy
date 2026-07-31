@@ -21,6 +21,23 @@ $ nix-store --generate-binary-cache-key cache1.example.org cache.key cache.pub
 $ nix copy --to http://localhost:3000?secret-key=$PWD/cache.key nixpkgs.hello
 ```
 
+## Development
+
+The Nix flake provides Go and golangci-lint:
+
+```sh
+nix develop
+go test ./...
+golangci-lint run
+```
+
+Build and check the package with:
+
+```sh
+nix build
+nix flake check
+```
+
 ## TODO
 
 * Section that explains how to setup GCS with the LB CDN.
