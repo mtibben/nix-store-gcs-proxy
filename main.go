@@ -218,7 +218,10 @@ func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
 		Addr: addr,
 		Handler: newHTTPHandler(
 			BucketProxy{store: store},
-			newCacheReadinessCheck(bucket),
+			cacheReadinessCheck(
+				newCacheReadinessCheck(bucket),
+				healthReadinessCacheTTL,
+			),
 			healthReadinessTimeout,
 		),
 		ReadHeaderTimeout: serverReadHeaderTimeout,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -168,6 +169,114 @@ func TestHTTPHandlerRoutesOtherPathsToProxy(t *testing.T) {
 	}
 	if !proxyCalled {
 		t.Error("proxy was not called")
+	}
+}
+
+func TestReadinessCheckCachesResults(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
+	var calls int
+	cache := &readinessResultCache{
+		check: func(context.Context) error {
+			calls++
+			return errReadinessUnavailable
+		},
+		ttl: time.Second,
+		now: func() time.Time {
+			return now
+		},
+	}
+
+	if err := cache.run(context.Background()); !errors.Is(err, errReadinessUnavailable) {
+		t.Fatalf("first check error = %v, want %v", err, errReadinessUnavailable)
+	}
+	if err := cache.run(context.Background()); !errors.Is(err, errReadinessUnavailable) {
+		t.Fatalf("cached check error = %v, want %v", err, errReadinessUnavailable)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 before expiry", calls)
+	}
+
+	now = now.Add(time.Second)
+	if err := cache.run(context.Background()); !errors.Is(err, errReadinessUnavailable) {
+		t.Fatalf("refreshed check error = %v, want %v", err, errReadinessUnavailable)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2 after expiry", calls)
+	}
+}
+
+func TestReadinessCheckCoalescesConcurrentCalls(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	check := cacheReadinessCheck(
+		func(context.Context) error {
+			if calls.Add(1) == 1 {
+				close(started)
+			}
+			<-release
+			return nil
+		},
+		time.Second,
+	)
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- check(context.Background())
+	}()
+	<-started
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- check(context.Background())
+	}()
+
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Errorf("first check error = %v, want nil", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Errorf("second check error = %v, want nil", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+}
+
+func TestReadinessCheckWaitHonorsContext(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	check := cacheReadinessCheck(
+		func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		},
+		time.Second,
+	)
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- check(context.Background())
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := check(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("waiting check error = %v, want context canceled", err)
+	}
+
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Errorf("first check error = %v, want nil", err)
 	}
 }
 

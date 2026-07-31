@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -12,6 +13,7 @@ import (
 
 const (
 	cacheInfoObjectName     = "nix-cache-info"
+	healthReadinessCacheTTL = time.Second
 	healthReadinessTimeout  = 5 * time.Second
 	livenessEndpointPath    = "/livez"
 	readinessEndpointPath   = "/readyz"
@@ -21,6 +23,18 @@ const (
 )
 
 type readinessCheck func(context.Context) error
+
+type readinessResultCache struct {
+	check readinessCheck
+	ttl   time.Duration
+	now   func() time.Time
+
+	mu        sync.Mutex
+	hasResult bool
+	result    error
+	expiresAt time.Time
+	inFlight  chan struct{}
+}
 
 func newHTTPHandler(
 	proxy http.Handler,
@@ -59,6 +73,55 @@ func newCacheReadinessCheck(bucket *storage.BucketHandle) readinessCheck {
 		}
 
 		return nil
+	}
+}
+
+func cacheReadinessCheck(check readinessCheck, ttl time.Duration) readinessCheck {
+	cache := &readinessResultCache{
+		check: check,
+		ttl:   ttl,
+		now:   time.Now,
+	}
+
+	return cache.run
+}
+
+func (c *readinessResultCache) run(ctx context.Context) error {
+	for {
+		now := c.now()
+
+		c.mu.Lock()
+		if c.hasResult && now.Before(c.expiresAt) {
+			result := c.result
+			c.mu.Unlock()
+			return result
+		}
+		if c.inFlight != nil {
+			inFlight := c.inFlight
+			c.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("wait for readiness check: %w", ctx.Err())
+			case <-inFlight:
+				continue
+			}
+		}
+
+		c.inFlight = make(chan struct{})
+		c.mu.Unlock()
+
+		result := c.check(ctx)
+
+		c.mu.Lock()
+		c.result = result
+		c.hasResult = true
+		c.expiresAt = c.now().Add(c.ttl)
+		close(c.inFlight)
+		c.inFlight = nil
+		c.mu.Unlock()
+
+		return result
 	}
 }
 
