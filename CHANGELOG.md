@@ -9,8 +9,14 @@ Unreleased
     context propagation, and resource cleanup
   * harden the HTTP server with timeouts, signal handling, graceful shutdown,
     and wrapped lifecycle errors
+  * preserve GCS response metadata and validators, and support byte-range and
+    conditional cache reads
+  * reduce memory used by concurrent small uploads while retaining resumable
+    16 MiB chunks for large and unknown-size objects
+  * coalesce bursts of GCS-backed readiness checks with a one-second result
+    cache
   * modernize the Nix build and document current flake, upload, cache-consumer,
-    and health-check workflows
+    health-check, and localhost-first performance workflows
 
 
 0.1.0 / 2019-09-04

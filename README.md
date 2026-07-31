@@ -26,7 +26,7 @@ From a checkout of this repository:
 ```sh
 nix run . -- \
   --bucket-name my-cache-bucket \
-  --addr localhost:3000
+  --addr 127.0.0.1:3000
 ```
 
 Replace `.` with `github:mtibben/nix-store-gcs-proxy` to run the package
@@ -34,8 +34,8 @@ directly from GitHub.
 
 ### Health checks
 
-The proxy exposes separate liveness and readiness endpoints for load balancers
-and container orchestrators:
+The proxy exposes separate liveness and readiness endpoints for local
+diagnostics:
 
 - `GET` or `HEAD /livez` returns `200 OK` when the HTTP process is responding.
   It does not contact Google Cloud Storage, so use it as a liveness or restart
@@ -44,13 +44,14 @@ and container orchestrators:
   `nix-cache-info` object from the configured bucket. This checks credentials,
   network connectivity, object access, and that the bucket has been initialized
   as a Nix binary cache. The check times out after five seconds and returns
-  `503 Service Unavailable` on failure.
+  `503 Service Unavailable` on failure. Results are cached for one second so
+  repeated diagnostics do not repeatedly contact GCS.
 
 For example:
 
 ```sh
-curl --fail http://localhost:3000/livez
-curl --fail http://localhost:3000/readyz
+curl --fail http://127.0.0.1:3000/livez
+curl --fail http://127.0.0.1:3000/readyz
 ```
 
 Nix creates `nix-cache-info` when it first copies a path to an empty binary
@@ -82,7 +83,7 @@ In another terminal, copy a Nix installable and its closure through the proxy:
 
 ```sh
 nix copy \
-  --to "http://localhost:3000?secret-key=$PWD/cache.key" \
+  --to "http://127.0.0.1:3000?secret-key=$PWD/cache.key" \
   nixpkgs#hello
 ```
 
@@ -96,7 +97,7 @@ for a single command:
 
 ```sh
 nix build nixpkgs#hello \
-  --extra-substituters http://localhost:3000 \
+  --extra-substituters http://127.0.0.1:3000 \
   --extra-trusted-public-keys "$(cat cache.pub)"
 ```
 
@@ -104,12 +105,27 @@ To configure the client persistently, add the following to `nix.conf`, replacing
 the example public key with the contents of `cache.pub`:
 
 ```ini
-extra-substituters = http://localhost:3000
+extra-substituters = http://127.0.0.1:3000
 extra-trusted-public-keys = cache1.example.org:<public-key>
 ```
 
 Multi-user Nix installations may require a trusted user to change these
-settings. Use HTTPS when exposing the proxy outside localhost.
+settings.
+
+### Local performance
+
+The intended request path is a local Nix process through
+`http://127.0.0.1:3000` to GCS. The loopback endpoint uses persistent HTTP/1.1
+connections. Adding local TLS solely to negotiate HTTP/2, or adding h2c support,
+would add complexity without reducing the upstream GCS latency.
+
+Object bodies stream directly between Nix and GCS without being staged on disk
+or buffered in full. Byte ranges and HTTP validators avoid unnecessary
+transfers when Nix resumes or revalidates a download. Uploads with a known small
+size use a correspondingly small GCS retry buffer; large or unknown-size
+uploads retain the SDK's 16 MiB resumable chunks. The proxy does not keep a
+second local object cache because successfully substituted paths already live
+in the local Nix store.
 
 ## Development
 
@@ -127,10 +143,6 @@ Build and check the package with:
 nix build
 nix flake check
 ```
-
-## TODO
-
-* Section that explains how to setup GCS with the LB CDN.
 
 ## License
 
