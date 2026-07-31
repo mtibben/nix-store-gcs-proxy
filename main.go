@@ -50,7 +50,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
 		w.Header().Set("Accept-Ranges", "bytes")
 		if status := readPreconditionStatus(req, metadata); status != 0 {
-			writeReadPreconditionResponse(w, status)
+			writePreconditionResponse(w, status)
 			return
 		}
 	case http.MethodGet:
@@ -76,7 +76,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
 		if status := readPreconditionStatus(req, object.metadata); status != 0 {
-			writeReadPreconditionResponse(w, status)
+			writePreconditionResponse(w, status)
 			return
 		}
 		if !object.metadata.decompressed {
@@ -90,19 +90,26 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			log.Println(err)
 		}
 	case http.MethodPut:
-		// Write the object to GCS
-		wc := s.store.newWriter(ctx, objectPath, writeOptionsFromRequest(req))
+		options, status, err := s.writeOptionsForRequest(ctx, objectPath, req)
+		if err != nil {
+			writeObjectReadError(w, err)
+			return
+		}
+		if status != 0 {
+			writePreconditionResponse(w, status)
+			return
+		}
+
+		wc := s.store.newWriter(ctx, objectPath, options)
 
 		if _, err := copyStream(wc, req.Body); err != nil {
 			wc.abort()
 			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
-			log.Println(uploadErr)
-			http.Error(w, uploadErr.Error(), http.StatusBadGateway)
+			writeObjectWriteError(w, uploadErr)
 			return
 		}
 		if err := wc.Close(); err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeObjectWriteError(w, err)
 			return
 		}
 
@@ -127,6 +134,10 @@ func (s BucketProxy) readObject(
 
 	byteRange, err := parseObjectByteRange(rangeHeader)
 	if err != nil {
+		if errors.Is(err, errRangeNotSupported) {
+			object, readErr := s.store.newReader(ctx, objectPath)
+			return object, false, readErr
+		}
 		return s.readAfterRangeFailure(ctx, objectPath, ifRange, err)
 	}
 
@@ -190,7 +201,7 @@ func (s BucketProxy) writeRangeError(
 	if status := readPreconditionStatus(req, metadata); status != 0 {
 		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
 		w.Header().Set("Accept-Ranges", "bytes")
-		writeReadPreconditionResponse(w, status)
+		writePreconditionResponse(w, status)
 		return
 	}
 
@@ -204,6 +215,50 @@ func writeObjectReadError(w http.ResponseWriter, err error) {
 	}
 
 	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
+func writeObjectWriteError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errObjectPreconditionFailed) {
+		writePreconditionResponse(w, http.StatusPreconditionFailed)
+		return
+	}
+
+	log.Println(err)
+	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
+func (s BucketProxy) writeOptionsForRequest(
+	ctx context.Context,
+	objectPath string,
+	req *http.Request,
+) (objectWriteOptions, int, error) {
+	options := writeOptionsFromRequest(req)
+	if !hasWritePreconditions(req.Header) {
+		return options, 0, nil
+	}
+
+	metadata, err := s.store.attributes(ctx, objectPath)
+	exists := true
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		exists = false
+		metadata = objectMetadata{}
+	} else if err != nil {
+		return objectWriteOptions{}, 0, err
+	}
+
+	status, applied := writePreconditionStatus(req.Header, metadata, exists)
+	if status != 0 || !applied {
+		return options, status, nil
+	}
+
+	if exists {
+		options.conditions.generationMatch = metadata.generation
+		options.conditions.metagenerationMatch = metadata.metageneration
+	} else {
+		options.conditions.doesNotExist = true
+	}
+
+	return options, 0, nil
 }
 
 func writeOptionsFromRequest(req *http.Request) objectWriteOptions {

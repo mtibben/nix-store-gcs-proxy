@@ -40,6 +40,21 @@ type objectWriteOptions struct {
 	contentDisposition string
 	cacheControl       string
 	chunkSize          int
+	conditions         objectWriteConditions
+}
+
+type objectWriteConditions struct {
+	doesNotExist        bool
+	generationMatch     int64
+	metagenerationMatch int64
+}
+
+func (c objectWriteConditions) toGCSConditions() storage.Conditions {
+	return storage.Conditions{
+		DoesNotExist:        c.doesNotExist,
+		GenerationMatch:     c.generationMatch,
+		MetagenerationMatch: c.metagenerationMatch,
+	}
 }
 
 type objectStore interface {
@@ -163,7 +178,11 @@ func (s *gcsObjectStore) newWriter(
 	options objectWriteOptions,
 ) objectWriter {
 	writerContext, cancelWriter := context.WithCancel(ctx)
-	writer := s.bucket.Object(objectName).NewWriter(writerContext)
+	object := s.bucket.Object(objectName)
+	if options.conditions != (objectWriteConditions{}) {
+		object = object.If(options.conditions.toGCSConditions())
+	}
+	writer := object.NewWriter(writerContext)
 	writer.ContentType = options.contentType
 	writer.ContentLanguage = options.contentLanguage
 	writer.ContentEncoding = options.contentEncoding
@@ -200,10 +219,14 @@ type gcsObjectWriter struct {
 	cancelWriter context.CancelFunc
 }
 
+var errObjectPreconditionFailed = errors.New("object precondition failed")
+
 func (w *gcsObjectWriter) Write(data []byte) (int, error) {
 	written, err := w.writer.Write(data)
 	if err != nil {
-		return written, fmt.Errorf("write object %q: %w", w.objectName, err)
+		return written, classifyObjectWriteError(
+			fmt.Errorf("write object %q: %w", w.objectName, err),
+		)
 	}
 
 	return written, nil
@@ -213,7 +236,9 @@ func (w *gcsObjectWriter) Close() error {
 	defer w.cancelWriter()
 
 	if err := w.writer.Close(); err != nil {
-		return fmt.Errorf("close object %q writer: %w", w.objectName, err)
+		return classifyObjectWriteError(
+			fmt.Errorf("close object %q writer: %w", w.objectName, err),
+		)
 	}
 
 	return nil
@@ -221,4 +246,13 @@ func (w *gcsObjectWriter) Close() error {
 
 func (w *gcsObjectWriter) abort() {
 	w.cancelWriter()
+}
+
+func classifyObjectWriteError(err error) error {
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return errors.Join(errObjectPreconditionFailed, err)
+	}
+
+	return err
 }

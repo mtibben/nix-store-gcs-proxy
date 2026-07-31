@@ -124,6 +124,13 @@ func TestBucketProxyServesByteRanges(t *testing.T) {
 			startOffset: 2,
 			body:        "2345",
 		},
+		"case insensitive unit": {
+			rangeHeader: "Bytes=2-5",
+			wantOffset:  2,
+			wantLength:  4,
+			startOffset: 2,
+			body:        "2345",
+		},
 		"open ended": {
 			rangeHeader: "bytes=6-",
 			wantOffset:  6,
@@ -219,9 +226,7 @@ func TestBucketProxyRejectsInvalidByteRanges(t *testing.T) {
 	t.Parallel()
 
 	tests := []string{
-		"items=0-1",
 		"bytes=1-0",
-		"bytes=0-1,3-4",
 		"bytes=-0",
 		"bytes=x-1",
 	}
@@ -247,6 +252,55 @@ func TestBucketProxyRejectsInvalidByteRanges(t *testing.T) {
 			BucketProxy{store: store}.ServeHTTP(response, request)
 
 			assertRangeNotSatisfiable(t, response, "bytes */10")
+		})
+	}
+}
+
+func TestBucketProxyIgnoresUnsupportedRanges(t *testing.T) {
+	t.Parallel()
+
+	for _, rangeHeader := range []string{
+		"items=0-1",
+		"bytes=0-1,3-4",
+	} {
+		t.Run(rangeHeader, func(t *testing.T) {
+			t.Parallel()
+
+			fullReads := 0
+			store := &fakeObjectStore{
+				newReaderFunc: func(context.Context, string) (objectRead, error) {
+					fullReads++
+					return objectRead{
+						body:          io.NopCloser(strings.NewReader("cache data")),
+						metadata:      objectMetadata{size: 10},
+						contentLength: 10,
+					}, nil
+				},
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"/example.nar",
+				nil,
+			)
+			request.Header.Set("Range", rangeHeader)
+			request.Header.Set("If-Range", `"current"`)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+			}
+			if response.Body.String() != "cache data" {
+				t.Errorf("body = %q, want cache data", response.Body.String())
+			}
+			if fullReads != 1 {
+				t.Errorf("full reads = %d, want 1", fullReads)
+			}
+			if contentRange := response.Header().Get("Content-Range"); contentRange != "" {
+				t.Errorf("Content-Range = %q, want empty", contentRange)
+			}
 		})
 	}
 }

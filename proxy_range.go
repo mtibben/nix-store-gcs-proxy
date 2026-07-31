@@ -11,6 +11,7 @@ import (
 
 var errRangeNotSatisfiable = errors.New("range not satisfiable")
 var errInvalidByteRange = fmt.Errorf("%w: invalid byte range", errRangeNotSatisfiable)
+var errRangeNotSupported = errors.New("range not supported")
 
 type objectByteRange struct {
 	offset int64
@@ -18,17 +19,29 @@ type objectByteRange struct {
 }
 
 func parseObjectByteRange(value string) (objectByteRange, error) {
-	const rangePrefix = "bytes="
-
-	if !strings.HasPrefix(value, rangePrefix) {
+	unit, value, ok := strings.Cut(value, "=")
+	if !ok {
 		return objectByteRange{}, fmt.Errorf(
-			"%w: only byte ranges are supported",
+			"%w: missing range unit separator",
 			errInvalidByteRange,
 		)
 	}
+	if !strings.EqualFold(unit, "bytes") {
+		return objectByteRange{}, fmt.Errorf(
+			"%w: range unit %q",
+			errRangeNotSupported,
+			unit,
+		)
+	}
 
-	value = strings.TrimSpace(strings.TrimPrefix(value, rangePrefix))
-	if value == "" || strings.Contains(value, ",") {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, ",") {
+		return objectByteRange{}, fmt.Errorf(
+			"%w: multiple byte ranges",
+			errRangeNotSupported,
+		)
+	}
+	if value == "" {
 		return objectByteRange{}, fmt.Errorf(
 			"%w: exactly one byte range is required",
 			errInvalidByteRange,

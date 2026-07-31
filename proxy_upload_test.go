@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"cloud.google.com/go/storage"
 )
 
 func TestUploadChunkSize(t *testing.T) {
@@ -139,6 +143,220 @@ func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 	}
 }
 
+func TestBucketProxyHonorsWritePreconditions(t *testing.T) {
+	t.Parallel()
+
+	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
+	metadata := objectMetadata{
+		lastModified:   modified,
+		generation:     42,
+		metageneration: 3,
+	}
+	matchCurrentGeneration := objectWriteConditions{
+		generationMatch:     42,
+		metagenerationMatch: 3,
+	}
+
+	tests := map[string]struct {
+		headers        map[string]string
+		objectExists   bool
+		wantStatus     int
+		wantWrite      bool
+		wantConditions objectWriteConditions
+	}{
+		"matching If-Match": {
+			headers: map[string]string{
+				"If-Match": `"gcs-42-3"`,
+			},
+			objectExists:   true,
+			wantStatus:     http.StatusOK,
+			wantWrite:      true,
+			wantConditions: matchCurrentGeneration,
+		},
+		"stale If-Match": {
+			headers: map[string]string{
+				"If-Match": `"old"`,
+			},
+			objectExists: true,
+			wantStatus:   http.StatusPreconditionFailed,
+		},
+		"If-Match wildcard for missing object": {
+			headers: map[string]string{
+				"If-Match": "*",
+			},
+			wantStatus: http.StatusPreconditionFailed,
+		},
+		"matching If-None-Match": {
+			headers: map[string]string{
+				"If-None-Match": `"gcs-42-3"`,
+			},
+			objectExists: true,
+			wantStatus:   http.StatusPreconditionFailed,
+		},
+		"nonmatching If-None-Match": {
+			headers: map[string]string{
+				"If-None-Match": `"old"`,
+			},
+			objectExists:   true,
+			wantStatus:     http.StatusOK,
+			wantWrite:      true,
+			wantConditions: matchCurrentGeneration,
+		},
+		"If-None-Match wildcard for existing object": {
+			headers: map[string]string{
+				"If-None-Match": "*",
+			},
+			objectExists: true,
+			wantStatus:   http.StatusPreconditionFailed,
+		},
+		"If-None-Match wildcard for missing object": {
+			headers: map[string]string{
+				"If-None-Match": "*",
+			},
+			wantStatus: http.StatusOK,
+			wantWrite:  true,
+			wantConditions: objectWriteConditions{
+				doesNotExist: true,
+			},
+		},
+		"matching If-Unmodified-Since": {
+			headers: map[string]string{
+				"If-Unmodified-Since": modified.Format(http.TimeFormat),
+			},
+			objectExists:   true,
+			wantStatus:     http.StatusOK,
+			wantWrite:      true,
+			wantConditions: matchCurrentGeneration,
+		},
+		"stale If-Unmodified-Since": {
+			headers: map[string]string{
+				"If-Unmodified-Since": modified.Add(-time.Second).Format(http.TimeFormat),
+			},
+			objectExists: true,
+			wantStatus:   http.StatusPreconditionFailed,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			const content = "cache data"
+			attributeCalls := 0
+			writerCalls := 0
+			writer := &trackingObjectWriter{}
+			store := &fakeObjectStore{
+				attributesFunc: func(context.Context, string) (objectMetadata, error) {
+					attributeCalls++
+					if !test.objectExists {
+						return objectMetadata{}, storage.ErrObjectNotExist
+					}
+
+					return metadata, nil
+				},
+				newWriterFunc: func(
+					_ context.Context,
+					_ string,
+					options objectWriteOptions,
+				) objectWriter {
+					writerCalls++
+					if options.conditions != test.wantConditions {
+						t.Errorf(
+							"write conditions = %+v, want %+v",
+							options.conditions,
+							test.wantConditions,
+						)
+					}
+					return writer
+				},
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodPut,
+				"/example.nar",
+				strings.NewReader(content),
+			)
+			for headerName, value := range test.headers {
+				request.Header.Set(headerName, value)
+			}
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Errorf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if attributeCalls != 1 {
+				t.Errorf("attribute calls = %d, want 1", attributeCalls)
+			}
+			wantWriterCalls := 0
+			if test.wantWrite {
+				wantWriterCalls = 1
+			}
+			if writerCalls != wantWriterCalls {
+				t.Errorf("writer calls = %d, want %d", writerCalls, wantWriterCalls)
+			}
+			if test.wantWrite && writer.String() != content {
+				t.Errorf("uploaded body = %q, want %q", writer.String(), content)
+			}
+			if test.wantStatus == http.StatusPreconditionFailed {
+				if response.Body.Len() != 0 {
+					t.Errorf("body = %q, want empty", response.Body.String())
+				}
+				assertPreconditionFailedHeaders(t, response.Header())
+			}
+		})
+	}
+}
+
+func TestBucketProxyReportsConcurrentWritePreconditionFailure(t *testing.T) {
+	t.Parallel()
+
+	writer := &trackingObjectWriter{
+		closeErr: fmt.Errorf("finish conditional upload: %w", errObjectPreconditionFailed),
+	}
+	store := &fakeObjectStore{
+		attributesFunc: func(context.Context, string) (objectMetadata, error) {
+			return objectMetadata{
+				generation:     42,
+				metageneration: 3,
+			}, nil
+		},
+		newWriterFunc: func(
+			context.Context,
+			string,
+			objectWriteOptions,
+		) objectWriter {
+			return writer
+		},
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader("cache data"),
+	)
+	request.Header.Set("If-Match", `"gcs-42-3"`)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusPreconditionFailed {
+		t.Errorf(
+			"status = %d, want %d",
+			response.Code,
+			http.StatusPreconditionFailed,
+		)
+	}
+	if response.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", response.Body.String())
+	}
+	if !writer.closed {
+		t.Error("writer was not closed")
+	}
+	assertPreconditionFailedHeaders(t, response.Header())
+}
+
 type bufferWriteCloser struct {
 	bytes.Buffer
 }
@@ -166,13 +384,14 @@ func (r *failingReader) Read(data []byte) (int, error) {
 
 type trackingObjectWriter struct {
 	bytes.Buffer
-	aborted bool
-	closed  bool
+	aborted  bool
+	closed   bool
+	closeErr error
 }
 
 func (w *trackingObjectWriter) Close() error {
 	w.closed = true
-	return nil
+	return w.closeErr
 }
 
 func (w *trackingObjectWriter) abort() {

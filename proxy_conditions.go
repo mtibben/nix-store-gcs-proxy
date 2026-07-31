@@ -38,12 +38,58 @@ func readPreconditionStatus(req *http.Request, metadata objectMetadata) int {
 	return 0
 }
 
-func writeReadPreconditionResponse(w http.ResponseWriter, status int) {
+func hasWritePreconditions(header http.Header) bool {
+	return len(header.Values("If-Match")) > 0 ||
+		len(header.Values("If-None-Match")) > 0 ||
+		len(header.Values("If-Unmodified-Since")) > 0
+}
+
+func writePreconditionStatus(
+	header http.Header,
+	metadata objectMetadata,
+	exists bool,
+) (status int, applied bool) {
+	currentETag := objectETag(metadata)
+
+	match := conditionNotPresent
+	if len(header.Values("If-Match")) > 0 {
+		applied = true
+		if exists {
+			match = checkIfMatch(header, currentETag)
+		} else {
+			match = conditionFalse
+		}
+	} else if exists {
+		match = checkIfUnmodifiedSince(header, metadata.lastModified)
+		applied = match != conditionNotPresent
+	}
+	if match == conditionFalse {
+		return http.StatusPreconditionFailed, applied
+	}
+
+	noneMatch := conditionNotPresent
+	if len(header.Values("If-None-Match")) > 0 {
+		applied = true
+		if exists {
+			noneMatch = checkIfNoneMatch(header, currentETag)
+		} else {
+			noneMatch = conditionTrue
+		}
+	}
+	if noneMatch == conditionFalse {
+		return http.StatusPreconditionFailed, applied
+	}
+
+	return 0, applied
+}
+
+func writePreconditionResponse(w http.ResponseWriter, status int) {
+	header := w.Header()
+	header.Del("Content-Type")
+	header.Del("Content-Length")
+	header.Del("Content-Encoding")
+
 	if status == http.StatusNotModified {
-		header := w.Header()
-		header.Del("Content-Type")
-		header.Del("Content-Length")
-		header.Del("Content-Encoding")
 		if header.Get("ETag") != "" {
 			header.Del("Last-Modified")
 		}

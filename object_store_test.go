@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -139,6 +141,59 @@ func TestGCSObjectStorePreservesMetadataAndStoredEncoding(t *testing.T) {
 	}
 	if got := downloadRequests.Load(); got != 1 {
 		t.Errorf("download requests = %d, want 1", got)
+	}
+}
+
+func TestClassifyObjectWriteErrorMarksPreconditionFailures(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &googleapi.Error{Code: http.StatusPreconditionFailed}
+	wrapped := fmt.Errorf("close object writer: %w", apiErr)
+	err := classifyObjectWriteError(wrapped)
+
+	if !errors.Is(err, errObjectPreconditionFailed) {
+		t.Errorf("error = %v, want errObjectPreconditionFailed", err)
+	}
+	if !errors.Is(err, apiErr) {
+		t.Errorf("error = %v, want wrapped API error", err)
+	}
+}
+
+func TestObjectWriteConditionsConvertToGCSConditions(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		conditions objectWriteConditions
+		want       storage.Conditions
+	}{
+		"existing generation": {
+			conditions: objectWriteConditions{
+				generationMatch:     42,
+				metagenerationMatch: 3,
+			},
+			want: storage.Conditions{
+				GenerationMatch:     42,
+				MetagenerationMatch: 3,
+			},
+		},
+		"object must not exist": {
+			conditions: objectWriteConditions{
+				doesNotExist: true,
+			},
+			want: storage.Conditions{
+				DoesNotExist: true,
+			},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := test.conditions.toGCSConditions(); got != test.want {
+				t.Errorf("GCS conditions = %+v, want %+v", got, test.want)
+			}
+		})
 	}
 }
 

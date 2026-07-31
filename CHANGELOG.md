@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Abort failed streaming uploads instead of finalizing partial GCS objects.
 - Evaluate read preconditions before reporting invalid or unsatisfiable ranges.
+- Enforce conditional `PUT` requests atomically with GCS object generations.
+- Return correctly framed empty responses when HTTP preconditions fail.
+- Treat byte-range units case-insensitively and ignore unsupported range requests.
 - Advertise the proxy's supported methods in `405 Method Not Allowed`
   responses.
 

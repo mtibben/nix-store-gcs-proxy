@@ -124,7 +124,57 @@ func TestBucketProxyHonorsReadPreconditions(t *testing.T) {
 			if test.wantStatus == http.StatusNotModified {
 				assertNotModifiedHeaders(t, response.Header())
 			}
+			if test.wantStatus == http.StatusPreconditionFailed {
+				assertPreconditionFailedHeaders(t, response.Header())
+			}
 		})
+	}
+}
+
+func TestFailedReadPreconditionHasCompleteHTTPBody(t *testing.T) {
+	t.Parallel()
+
+	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
+	server := httptest.NewServer(BucketProxy{store: conditionalObjectStore(modified)})
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		server.URL+"/example.nar",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	request.Header.Set("If-Match", `"old"`)
+
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("send request: %v", err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Errorf("close response body: %v", err)
+		}
+	}()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if response.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf(
+			"status = %d, want %d",
+			response.StatusCode,
+			http.StatusPreconditionFailed,
+		)
+	}
+	if len(body) != 0 {
+		t.Errorf("body = %q, want empty", body)
+	}
+	if response.ContentLength != 0 {
+		t.Errorf("Content-Length = %d, want 0", response.ContentLength)
 	}
 }
 
@@ -213,6 +263,9 @@ func TestBucketProxyEvaluatesPreconditionsBeforeRangeErrors(t *testing.T) {
 			}
 			if test.wantStatus == http.StatusNotModified {
 				assertNotModifiedHeaders(t, response.Header())
+			}
+			if test.wantStatus == http.StatusPreconditionFailed {
+				assertPreconditionFailedHeaders(t, response.Header())
 			}
 		})
 	}
@@ -498,6 +551,20 @@ func assertNotModifiedHeaders(t *testing.T, header http.Header) {
 		"Content-Length",
 		"Content-Encoding",
 		"Last-Modified",
+	} {
+		if value := header.Get(name); value != "" {
+			t.Errorf("%s = %q, want empty", name, value)
+		}
+	}
+}
+
+func assertPreconditionFailedHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+
+	for _, name := range []string{
+		"Content-Type",
+		"Content-Length",
+		"Content-Encoding",
 	} {
 		if value := header.Get(name); value != "" {
 			t.Errorf("%s = %q, want empty", name, value)
