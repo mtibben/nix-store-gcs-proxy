@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -152,9 +154,11 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 
 	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
 	tests := map[string]struct {
-		ifRange    string
-		wantStatus int
-		wantBody   string
+		ifRange          string
+		wantStatus       int
+		wantBody         string
+		wantMetadataRead int
+		wantFullRead     int
 	}{
 		"matching ETag": {
 			ifRange:    `"gcs-42-3"`,
@@ -162,14 +166,16 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			wantBody:   "2345",
 		},
 		"weak ETag": {
-			ifRange:    `W/"gcs-42-3"`,
-			wantStatus: http.StatusOK,
-			wantBody:   "cache data",
+			ifRange:      `W/"gcs-42-3"`,
+			wantStatus:   http.StatusOK,
+			wantBody:     "cache data",
+			wantFullRead: 1,
 		},
 		"stale ETag": {
-			ifRange:    `"old"`,
-			wantStatus: http.StatusOK,
-			wantBody:   "cache data",
+			ifRange:      `"old"`,
+			wantStatus:   http.StatusOK,
+			wantBody:     "cache data",
+			wantFullRead: 1,
 		},
 		"matching date": {
 			ifRange:    modified.Format(http.TimeFormat),
@@ -177,9 +183,10 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			wantBody:   "2345",
 		},
 		"stale date": {
-			ifRange:    modified.Add(-time.Second).Format(http.TimeFormat),
-			wantStatus: http.StatusOK,
-			wantBody:   "cache data",
+			ifRange:      modified.Add(-time.Second).Format(http.TimeFormat),
+			wantStatus:   http.StatusOK,
+			wantBody:     "cache data",
+			wantFullRead: 1,
 		},
 	}
 
@@ -188,6 +195,35 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			t.Parallel()
 
 			store := conditionalObjectStore(modified)
+			attributes := store.attributesFunc
+			fullReader := store.newReaderFunc
+			rangeReader := store.newRangeReaderFunc
+			metadataReads := 0
+			fullReads := 0
+			rangeReads := 0
+			var rangedBody *trackingReadCloser
+			store.attributesFunc = func(ctx context.Context, name string) (objectMetadata, error) {
+				metadataReads++
+				return attributes(ctx, name)
+			}
+			store.newReaderFunc = func(ctx context.Context, name string) (objectRead, error) {
+				fullReads++
+				return fullReader(ctx, name)
+			}
+			store.newRangeReaderFunc = func(
+				ctx context.Context,
+				name string,
+				offset, length int64,
+			) (objectRead, error) {
+				rangeReads++
+				object, err := rangeReader(ctx, name, offset, length)
+				if err != nil {
+					return objectRead{}, err
+				}
+				rangedBody = &trackingReadCloser{ReadCloser: object.body}
+				object.body = rangedBody
+				return object, nil
+			}
 			request := httptest.NewRequestWithContext(
 				context.Background(),
 				http.MethodGet,
@@ -206,7 +242,143 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			if response.Body.String() != test.wantBody {
 				t.Errorf("body = %q, want %q", response.Body.String(), test.wantBody)
 			}
+			if metadataReads != test.wantMetadataRead {
+				t.Errorf("metadata reads = %d, want %d", metadataReads, test.wantMetadataRead)
+			}
+			if fullReads != test.wantFullRead {
+				t.Errorf("full reads = %d, want %d", fullReads, test.wantFullRead)
+			}
+			if rangeReads != 1 {
+				t.Errorf("range reads = %d, want 1", rangeReads)
+			}
+			if rangedBody == nil || !rangedBody.closed {
+				t.Error("ranged body was not closed")
+			}
 		})
+	}
+}
+
+func TestBucketProxyChecksIfRangeAfterRangeFailure(t *testing.T) {
+	t.Parallel()
+
+	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
+	tests := map[string]struct {
+		rangeHeader   string
+		wantRangeRead int
+	}{
+		"invalid range": {
+			rangeHeader: "bytes=nope",
+		},
+		"unsatisfiable range": {
+			rangeHeader:   "bytes=20-",
+			wantRangeRead: 1,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := conditionalObjectStore(modified)
+			fullReader := store.newReaderFunc
+			metadataReads := 0
+			fullReads := 0
+			rangeReads := 0
+			store.attributesFunc = func(context.Context, string) (objectMetadata, error) {
+				metadataReads++
+				return objectMetadata{
+					lastModified:   modified,
+					generation:     42,
+					metageneration: 3,
+				}, nil
+			}
+			store.newReaderFunc = func(ctx context.Context, name string) (objectRead, error) {
+				fullReads++
+				return fullReader(ctx, name)
+			}
+			store.newRangeReaderFunc = func(
+				context.Context,
+				string,
+				int64,
+				int64,
+			) (objectRead, error) {
+				rangeReads++
+				return objectRead{}, errRangeNotSatisfiable
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"/example.nar",
+				nil,
+			)
+			request.Header.Set("Range", test.rangeHeader)
+			request.Header.Set("If-Range", `"old"`)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+			}
+			if response.Body.String() != "cache data" {
+				t.Errorf("body = %q, want cache data", response.Body.String())
+			}
+			if metadataReads != 1 {
+				t.Errorf("metadata reads = %d, want 1", metadataReads)
+			}
+			if fullReads != 1 {
+				t.Errorf("full reads = %d, want 1", fullReads)
+			}
+			if rangeReads != test.wantRangeRead {
+				t.Errorf("range reads = %d, want %d", rangeReads, test.wantRangeRead)
+			}
+		})
+	}
+}
+
+func TestBucketProxyReportsStaleRangeCloseError(t *testing.T) {
+	t.Parallel()
+
+	rangedBody := &trackingReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("2345")),
+		closeErr:   errTrackedRangeClose,
+	}
+	store := &fakeObjectStore{
+		newRangeReaderFunc: func(
+			context.Context,
+			string,
+			int64,
+			int64,
+		) (objectRead, error) {
+			return objectRead{
+				body: rangedBody,
+				metadata: objectMetadata{
+					generation:     42,
+					metageneration: 3,
+				},
+			}, nil
+		},
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"/example.nar",
+		nil,
+	)
+	request.Header.Set("Range", "bytes=2-5")
+	request.Header.Set("If-Range", `"old"`)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusBadGateway)
+	}
+	if !rangedBody.closed {
+		t.Error("ranged body close was not attempted")
+	}
+	if !strings.Contains(response.Body.String(), errTrackedRangeClose.Error()) {
+		t.Errorf("body = %q, want close error", response.Body.String())
 	}
 }
 
@@ -262,4 +434,25 @@ func assertNotModifiedHeaders(t *testing.T, header http.Header) {
 			t.Errorf("%s = %q, want empty", name, value)
 		}
 	}
+}
+
+type trackingReadCloser struct {
+	io.ReadCloser
+	closeErr error
+	closed   bool
+}
+
+var errTrackedRangeClose = errors.New("close range")
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	if r.closeErr != nil {
+		return r.closeErr
+	}
+
+	if err := r.ReadCloser.Close(); err != nil {
+		return fmt.Errorf("close tracked reader: %w", err)
+	}
+
+	return nil
 }

@@ -134,20 +134,9 @@ func (s BucketProxy) readObject(
 		return object, false, err
 	}
 
-	if ifRange != "" {
-		metadata, err := s.store.attributes(ctx, objectPath)
-		if err != nil {
-			return objectRead{}, false, err
-		}
-		if !ifRangeMatches(ifRange, metadata) {
-			object, err := s.store.newReader(ctx, objectPath)
-			return object, false, err
-		}
-	}
-
 	byteRange, err := parseObjectByteRange(rangeHeader)
 	if err != nil {
-		return objectRead{}, false, err
+		return s.readAfterRangeFailure(ctx, objectPath, ifRange, err)
 	}
 
 	object, err := s.store.newRangeReader(
@@ -156,7 +145,44 @@ func (s BucketProxy) readObject(
 		byteRange.offset,
 		byteRange.length,
 	)
-	return object, true, err
+	if err != nil {
+		return s.readAfterRangeFailure(ctx, objectPath, ifRange, err)
+	}
+	if ifRange == "" || ifRangeMatches(ifRange, object.metadata) {
+		return object, true, nil
+	}
+
+	if err := object.body.Close(); err != nil {
+		return objectRead{}, false, fmt.Errorf(
+			"close stale object %q range: %w",
+			objectPath,
+			err,
+		)
+	}
+
+	fullObject, err := s.store.newReader(ctx, objectPath)
+	return fullObject, false, err
+}
+
+func (s BucketProxy) readAfterRangeFailure(
+	ctx context.Context,
+	objectPath, ifRange string,
+	rangeErr error,
+) (objectRead, bool, error) {
+	if ifRange == "" {
+		return objectRead{}, false, rangeErr
+	}
+
+	metadata, err := s.store.attributes(ctx, objectPath)
+	if err != nil {
+		return objectRead{}, false, err
+	}
+	if ifRangeMatches(ifRange, metadata) {
+		return objectRead{}, false, rangeErr
+	}
+
+	object, err := s.store.newReader(ctx, objectPath)
+	return object, false, err
 }
 
 func (s BucketProxy) writeRangeError(
