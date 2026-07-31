@@ -73,6 +73,10 @@ func (s *gcsObjectStore) attributes(
 		return objectMetadata{}, fmt.Errorf("read object %q metadata: %w", objectName, err)
 	}
 
+	return objectMetadataFromGCSAttrs(attrs), nil
+}
+
+func objectMetadataFromGCSAttrs(attrs *storage.ObjectAttrs) objectMetadata {
 	return objectMetadata{
 		size:               attrs.Size,
 		contentType:        attrs.ContentType,
@@ -84,19 +88,24 @@ func (s *gcsObjectStore) attributes(
 		generation:         attrs.Generation,
 		metageneration:     attrs.Metageneration,
 		etag:               attrs.Etag,
-	}, nil
+	}
 }
 
 func (s *gcsObjectStore) newReader(
 	ctx context.Context,
 	objectName string,
 ) (objectRead, error) {
-	reader, err := s.bucket.Object(objectName).NewReader(ctx)
+	object, metadata, err := s.objectForRead(ctx, objectName)
+	if err != nil {
+		return objectRead{}, err
+	}
+
+	reader, err := object.NewReader(ctx)
 	if err != nil {
 		return objectRead{}, fmt.Errorf("open object %q: %w", objectName, err)
 	}
 
-	return objectReadFromGCSReader(reader), nil
+	return objectReadFromGCSReader(reader, metadata), nil
 }
 
 func (s *gcsObjectStore) newRangeReader(
@@ -104,7 +113,12 @@ func (s *gcsObjectStore) newRangeReader(
 	objectName string,
 	offset, length int64,
 ) (objectRead, error) {
-	reader, err := s.bucket.Object(objectName).NewRangeReader(ctx, offset, length)
+	object, metadata, err := s.objectForRead(ctx, objectName)
+	if err != nil {
+		return objectRead{}, err
+	}
+
+	reader, err := object.NewRangeReader(ctx, offset, length)
 	if err != nil {
 		var apiErr *googleapi.Error
 		if errors.As(err, &apiErr) &&
@@ -117,7 +131,30 @@ func (s *gcsObjectStore) newRangeReader(
 		return objectRead{}, fmt.Errorf("open object %q range: %w", objectName, err)
 	}
 
-	return objectReadFromGCSReader(reader), nil
+	return objectReadFromGCSReader(reader, metadata), nil
+}
+
+func (s *gcsObjectStore) objectForRead(
+	ctx context.Context,
+	objectName string,
+) (*storage.ObjectHandle, objectMetadata, error) {
+	object := s.bucket.Object(objectName)
+	attrs, err := object.Attrs(ctx)
+	if err != nil {
+		return nil, objectMetadata{}, fmt.Errorf(
+			"read object %q metadata: %w",
+			objectName,
+			err,
+		)
+	}
+
+	metadata := objectMetadataFromGCSAttrs(attrs)
+	object = object.If(storage.Conditions{
+		GenerationMatch:     attrs.Generation,
+		MetagenerationMatch: attrs.Metageneration,
+	}).ReadCompressed(true)
+
+	return object, metadata, nil
 }
 
 func (s *gcsObjectStore) newWriter(
@@ -143,19 +180,15 @@ func (s *gcsObjectStore) newWriter(
 	}
 }
 
-func objectReadFromGCSReader(reader *storage.Reader) objectRead {
+func objectReadFromGCSReader(
+	reader *storage.Reader,
+	metadata objectMetadata,
+) objectRead {
+	metadata.decompressed = reader.Attrs.Decompressed
+
 	return objectRead{
-		body: reader,
-		metadata: objectMetadata{
-			size:            reader.Attrs.Size,
-			contentType:     reader.Attrs.ContentType,
-			contentEncoding: reader.Attrs.ContentEncoding,
-			cacheControl:    reader.Attrs.CacheControl,
-			lastModified:    reader.Attrs.LastModified,
-			generation:      reader.Attrs.Generation,
-			metageneration:  reader.Attrs.Metageneration,
-			decompressed:    reader.Attrs.Decompressed,
-		},
+		body:          reader,
+		metadata:      metadata,
 		contentLength: reader.Remain(),
 		startOffset:   reader.Attrs.StartOffset,
 	}

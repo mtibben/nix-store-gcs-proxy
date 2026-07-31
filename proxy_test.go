@@ -230,7 +230,11 @@ func TestBucketProxyRejectsInvalidByteRanges(t *testing.T) {
 		t.Run(rangeHeader, func(t *testing.T) {
 			t.Parallel()
 
-			store := &fakeObjectStore{}
+			store := &fakeObjectStore{
+				attributesFunc: func(context.Context, string) (objectMetadata, error) {
+					return objectMetadata{size: 10}, nil
+				},
+			}
 			request := httptest.NewRequestWithContext(
 				context.Background(),
 				http.MethodGet,
@@ -242,7 +246,7 @@ func TestBucketProxyRejectsInvalidByteRanges(t *testing.T) {
 
 			BucketProxy{store: store}.ServeHTTP(response, request)
 
-			assertRangeNotSatisfiable(t, response, "")
+			assertRangeNotSatisfiable(t, response, "bytes */10")
 		})
 	}
 }
@@ -316,6 +320,27 @@ func TestBucketProxyIgnoresRangeAfterGCSDecompression(t *testing.T) {
 	}
 	if acceptRanges := response.Header().Get("Accept-Ranges"); acceptRanges != "" {
 		t.Errorf("Accept-Ranges = %q, want empty", acceptRanges)
+	}
+}
+
+func TestBucketProxyAdvertisesSupportedMethods(t *testing.T) {
+	t.Parallel()
+
+	response := serveRequest(
+		BucketProxy{store: &fakeObjectStore{}},
+		http.MethodPost,
+		"/example.nar",
+	)
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Errorf(
+			"status = %d, want %d",
+			response.Code,
+			http.StatusMethodNotAllowed,
+		)
+	}
+	if allow := response.Header().Get("Allow"); allow != "GET, HEAD, PUT" {
+		t.Errorf("Allow = %q, want GET, HEAD, PUT", allow)
 	}
 }
 

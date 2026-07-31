@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace Negroni with the standard library HTTP server.
 - Harden the HTTP server with timeouts, signal handling, graceful shutdown, and
   wrapped lifecycle errors.
-- Preserve GCS response metadata and validators.
-- Avoid a separate GCS metadata request when an `If-Range` validator matches.
+- Preserve complete GCS response metadata and validators while serving stored
+  object encodings consistently across `GET` and `HEAD`.
 - Reuse stream-copy buffers instead of allocating 32 KiB for every object.
 - Reduce memory used by concurrent small uploads while retaining resumable
   16 MiB chunks for large and unknown-size objects.
@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Abort failed streaming uploads instead of finalizing partial GCS objects.
+- Evaluate read preconditions before reporting invalid or unsatisfiable ranges.
+- Advertise the proxy's supported methods in `405 Method Not Allowed`
+  responses.
 
 ## [0.1.0] - 2019-09-04
 

@@ -44,11 +44,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case http.MethodHead:
 		metadata, err := s.store.attributes(ctx, objectPath)
 		if err != nil {
-			if errors.Is(err, storage.ErrObjectNotExist) {
-				http.Error(w, "File not found", http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-			}
+			writeObjectReadError(w, err)
 			return
 		}
 		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
@@ -66,18 +62,10 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		)
 		if err != nil {
 			if errors.Is(err, errRangeNotSatisfiable) {
-				if errors.Is(err, errInvalidByteRange) {
-					writeRangeNotSatisfiable(w, -1)
-				} else {
-					s.writeRangeError(w, ctx, objectPath)
-				}
+				s.writeRangeError(w, req, objectPath)
 				return
 			}
-			if errors.Is(err, storage.ErrObjectNotExist) {
-				http.Error(w, "File not found", http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-			}
+			writeObjectReadError(w, err)
 			return
 		}
 		defer func() {
@@ -122,6 +110,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			log.Println(err)
 		}
 	default:
+		w.Header().Set("Allow", "GET, HEAD, PUT")
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
 	}
@@ -189,17 +178,32 @@ func (s BucketProxy) readAfterRangeFailure(
 
 func (s BucketProxy) writeRangeError(
 	w http.ResponseWriter,
-	ctx context.Context,
+	req *http.Request,
 	objectPath string,
 ) {
-	metadata, err := s.store.attributes(ctx, objectPath)
+	metadata, err := s.store.attributes(req.Context(), objectPath)
 	if err != nil {
-		log.Printf("Read object metadata after range failure: %v", err)
-		writeRangeNotSatisfiable(w, -1)
+		writeObjectReadError(w, err)
+		return
+	}
+
+	if status := readPreconditionStatus(req, metadata); status != 0 {
+		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
+		w.Header().Set("Accept-Ranges", "bytes")
+		writeReadPreconditionResponse(w, status)
 		return
 	}
 
 	writeRangeNotSatisfiable(w, metadata.size)
+}
+
+func writeObjectReadError(w http.ResponseWriter, err error) {
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	http.Error(w, err.Error(), http.StatusBadGateway)
 }
 
 func writeOptionsFromRequest(req *http.Request) objectWriteOptions {

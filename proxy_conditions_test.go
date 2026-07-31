@@ -149,6 +149,75 @@ func TestBucketProxyHeadHonorsIfNoneMatch(t *testing.T) {
 	assertNotModifiedHeaders(t, response.Header())
 }
 
+func TestBucketProxyEvaluatesPreconditionsBeforeRangeErrors(t *testing.T) {
+	t.Parallel()
+
+	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
+	tests := map[string]struct {
+		rangeHeader string
+		headers     map[string]string
+		wantStatus  int
+	}{
+		"not modified before invalid range": {
+			rangeHeader: "bytes=nope",
+			headers: map[string]string{
+				"If-None-Match": `"gcs-42-3"`,
+			},
+			wantStatus: http.StatusNotModified,
+		},
+		"failed precondition before unsatisfiable range": {
+			rangeHeader: "bytes=20-",
+			headers: map[string]string{
+				"If-Match": `"old"`,
+			},
+			wantStatus: http.StatusPreconditionFailed,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := conditionalObjectStore(modified)
+			store.newRangeReaderFunc = func(
+				context.Context,
+				string,
+				int64,
+				int64,
+			) (objectRead, error) {
+				return objectRead{}, errRangeNotSatisfiable
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"/example.nar",
+				nil,
+			)
+			request.Header.Set("Range", test.rangeHeader)
+			for headerName, value := range test.headers {
+				request.Header.Set(headerName, value)
+			}
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Errorf(
+					"status = %d, want %d",
+					response.Code,
+					test.wantStatus,
+				)
+			}
+			if response.Body.Len() != 0 {
+				t.Errorf("body = %q, want empty", response.Body.String())
+			}
+			if test.wantStatus == http.StatusNotModified {
+				assertNotModifiedHeaders(t, response.Header())
+			}
+		})
+	}
+}
+
 func TestBucketProxyHonorsIfRange(t *testing.T) {
 	t.Parallel()
 
