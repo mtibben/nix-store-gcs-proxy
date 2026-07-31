@@ -195,7 +195,10 @@ func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 		context.Background(),
 		http.MethodPut,
 		"/example.nar",
-		&failingReader{},
+		&singleReadResultReader{
+			content: "partial",
+			err:     errUploadRead,
+		},
 	)
 	response := httptest.NewRecorder()
 
@@ -274,6 +277,90 @@ func TestBucketProxyReusesIdenticalConcurrentUploadAfterWriteFailure(t *testing.
 	}
 	if writer.aborted {
 		t.Error("failed writer was aborted before its storage error was recovered")
+	}
+}
+
+func TestBucketProxyDoesNotReuseUploadAfterSimultaneousReadAndWriteFailure(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	const content = "partial"
+	writer := &writeFailingExistingObjectWriter{}
+	readerCalls := 0
+	store := concurrentUploadStore(t, content)
+	openExisting := store.newReaderFunc
+	store.newWriterFunc = func(
+		_ context.Context,
+		_ string,
+		options objectWriteOptions,
+	) objectWriter {
+		if !options.conditions.doesNotExist {
+			t.Error("upload was not create-only")
+		}
+		if !options.reuseExisting {
+			t.Error("upload did not allow identical reuse")
+		}
+		return writer
+	}
+	store.newReaderFunc = func(ctx context.Context, name string) (objectRead, error) {
+		readerCalls++
+		return openExisting(ctx, name)
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		&singleReadResultReader{
+			content: content,
+			err:     errUploadRead,
+		},
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusBadGateway)
+	}
+	if !strings.Contains(response.Body.String(), errUploadRead.Error()) {
+		t.Errorf("body = %q, want upload read error", response.Body.String())
+	}
+	if readerCalls != 0 {
+		t.Errorf("existing object reads = %d, want 0", readerCalls)
+	}
+	if !writer.aborted {
+		t.Error("writer was not aborted")
+	}
+	if writer.closed {
+		t.Error("writer was closed after the request body failed")
+	}
+}
+
+func TestReadErrorRecorderAcceptsDataWithEOF(t *testing.T) {
+	t.Parallel()
+
+	const content = "cache data"
+	reader := &readErrorRecorder{
+		reader: &singleReadResultReader{
+			content: content,
+			err:     io.EOF,
+		},
+	}
+	data := make([]byte, len(content))
+
+	read, err := reader.Read(data)
+	if read != len(content) {
+		t.Errorf("read = %d, want %d", read, len(content))
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("error = %v, want EOF", err)
+	}
+	if string(data) != content {
+		t.Errorf("content = %q, want %q", data, content)
+	}
+	if reader.err != nil {
+		t.Errorf("recorded error = %v, want nil", reader.err)
 	}
 }
 
@@ -551,17 +638,19 @@ func (*bufferWriteCloser) abort() {}
 
 var errUploadRead = errors.New("upload read failed")
 
-type failingReader struct {
-	read bool
+type singleReadResultReader struct {
+	content string
+	err     error
+	read    bool
 }
 
-func (r *failingReader) Read(data []byte) (int, error) {
+func (r *singleReadResultReader) Read(data []byte) (int, error) {
 	if r.read {
-		return 0, errUploadRead
+		return 0, io.EOF
 	}
 	r.read = true
 
-	return copy(data, "partial"), errUploadRead
+	return copy(data, r.content), r.err
 }
 
 type trackingObjectWriter struct {

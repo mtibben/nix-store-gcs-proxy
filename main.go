@@ -111,10 +111,17 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		wc := s.store.newWriter(ctx, objectPath, plan.options)
 		digest := sizedHash{Hash: sha256.New()}
-		body := io.TeeReader(req.Body, &digest)
+		bodyReader := &readErrorRecorder{reader: req.Body}
+		body := io.TeeReader(bodyReader, &digest)
 		writer := &writeErrorRecorder{writer: wc}
 
 		if _, err := copyStream(writer, body); err != nil {
+			if bodyReader.err != nil {
+				wc.abort()
+				uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, bodyReader.err)
+				writeObjectWriteError(w, uploadErr)
+				return
+			}
 			if writer.err == nil {
 				wc.abort()
 				uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
@@ -170,6 +177,27 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
 	}
+}
+
+type readErrorRecorder struct {
+	reader io.Reader
+	err    error
+}
+
+func (r *readErrorRecorder) Read(data []byte) (int, error) {
+	read, err := r.reader.Read(data)
+	if err == nil {
+		return read, nil
+	}
+	if err == io.EOF {
+		return read, io.EOF
+	}
+
+	wrappedErr := fmt.Errorf("read upload body: %w", err)
+	if r.err == nil {
+		r.err = wrappedErr
+	}
+	return read, wrappedErr
 }
 
 type sizedHash struct {
