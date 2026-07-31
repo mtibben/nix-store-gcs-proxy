@@ -14,7 +14,6 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/urfave/cli"
-	"github.com/urfave/negroni"
 	"google.golang.org/api/option"
 )
 
@@ -130,12 +129,13 @@ func run(addr, bucketName string) (runErr error) {
 
 	bucket := client.Bucket(bucketName)
 
-	n := negroni.Classic() // Includes some default middlewares
-	n.UseHandler(BucketProxy{bucket})
-
 	server := &http.Server{
-		Addr:              addr,
-		Handler:           newHTTPHandler(n, newCacheReadinessCheck(bucket), healthReadinessTimeout),
+		Addr: addr,
+		Handler: newHTTPHandler(
+			BucketProxy{bucket},
+			newCacheReadinessCheck(bucket),
+			healthReadinessTimeout,
+		),
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}

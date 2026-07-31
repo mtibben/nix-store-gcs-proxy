@@ -7,7 +7,6 @@ toolchain go1.26.5
 require (
 	cloud.google.com/go/storage v1.64.0
 	github.com/urfave/cli v1.22.17
-	github.com/urfave/negroni v1.0.0
 	google.golang.org/api v0.291.0
 )
 
