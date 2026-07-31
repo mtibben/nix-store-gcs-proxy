@@ -130,14 +130,12 @@ func run(addr, bucketName string) (runErr error) {
 
 	bucket := client.Bucket(bucketName)
 
-	handler := BucketProxy{bucket}
-
 	n := negroni.Classic() // Includes some default middlewares
-	n.UseHandler(handler)
+	n.UseHandler(BucketProxy{bucket})
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           n,
+		Handler:           newHTTPHandler(n, newCacheReadinessCheck(bucket), healthReadinessTimeout),
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}
