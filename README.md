@@ -32,6 +32,31 @@ nix run . -- \
 Replace `.` with `github:mtibben/nix-store-gcs-proxy` to run the package
 directly from GitHub.
 
+### Health checks
+
+The proxy exposes separate liveness and readiness endpoints for load balancers
+and container orchestrators:
+
+- `GET` or `HEAD /livez` returns `200 OK` when the HTTP process is responding.
+  It does not contact Google Cloud Storage, so use it as a liveness or restart
+  check.
+- `GET` or `HEAD /readyz` returns `200 OK` when the proxy can read the
+  `nix-cache-info` object from the configured bucket. This checks credentials,
+  network connectivity, object access, and that the bucket has been initialized
+  as a Nix binary cache. The check times out after five seconds and returns
+  `503 Service Unavailable` on failure.
+
+For example:
+
+```sh
+curl --fail http://localhost:3000/livez
+curl --fail http://localhost:3000/readyz
+```
+
+Nix creates `nix-cache-info` when it first copies a path to an empty binary
+cache. Until that initial upload succeeds, `/livez` can pass while `/readyz`
+correctly reports that the cache is not ready.
+
 ### Create a signing key
 
 Nix signs paths written to binary caches. Generate a private key and derive the
