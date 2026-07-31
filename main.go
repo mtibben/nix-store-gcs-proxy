@@ -35,7 +35,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	switch req.Method {
 	case http.MethodHead:
-		_, err := s.store.attributes(ctx, objectPath)
+		metadata, err := s.store.attributes(ctx, objectPath)
 		if err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
@@ -44,6 +44,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 			return
 		}
+		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
 	case http.MethodGet:
 		object, err := s.store.newReader(ctx, objectPath)
 		if err != nil {
@@ -60,6 +61,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}()
 
+		setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
 		if _, err := io.Copy(w, object.body); err != nil {
 			log.Println(err)
 		}

@@ -18,6 +18,7 @@ type objectMetadata struct {
 	cacheControl       string
 	lastModified       time.Time
 	generation         int64
+	metageneration     int64
 	etag               string
 	decompressed       bool
 }
@@ -73,6 +74,7 @@ func (s *gcsObjectStore) attributes(
 		cacheControl:       attrs.CacheControl,
 		lastModified:       attrs.Updated,
 		generation:         attrs.Generation,
+		metageneration:     attrs.Metageneration,
 		etag:               attrs.Etag,
 	}, nil
 }
@@ -133,6 +135,7 @@ func objectReadFromGCSReader(reader *storage.Reader) objectRead {
 			cacheControl:    reader.Attrs.CacheControl,
 			lastModified:    reader.Attrs.LastModified,
 			generation:      reader.Attrs.Generation,
+			metageneration:  reader.Attrs.Metageneration,
 			decompressed:    reader.Attrs.Decompressed,
 		},
 		contentLength: reader.Remain(),
