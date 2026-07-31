@@ -232,8 +232,7 @@ func TestBucketProxyEvaluatesPreconditionsBeforeRangeErrors(t *testing.T) {
 			store.newRangeReaderFunc = func(
 				context.Context,
 				string,
-				int64,
-				int64,
+				objectByteRange,
 			) (objectRead, error) {
 				return objectRead{}, errRangeNotSatisfiable
 			}
@@ -336,10 +335,10 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			store.newRangeReaderFunc = func(
 				ctx context.Context,
 				name string,
-				offset, length int64,
+				byteRange objectByteRange,
 			) (objectRead, error) {
 				rangeReads++
-				object, err := rangeReader(ctx, name, offset, length)
+				object, err := rangeReader(ctx, name, byteRange)
 				if err != nil {
 					return objectRead{}, err
 				}
@@ -422,8 +421,7 @@ func TestBucketProxyChecksIfRangeAfterRangeFailure(t *testing.T) {
 			store.newRangeReaderFunc = func(
 				context.Context,
 				string,
-				int64,
-				int64,
+				objectByteRange,
 			) (objectRead, error) {
 				rangeReads++
 				return objectRead{}, errRangeNotSatisfiable
@@ -470,8 +468,7 @@ func TestBucketProxyReportsStaleRangeCloseError(t *testing.T) {
 		newRangeReaderFunc: func(
 			context.Context,
 			string,
-			int64,
-			int64,
+			objectByteRange,
 		) (objectRead, error) {
 			return objectRead{
 				body: rangedBody,
@@ -528,8 +525,7 @@ func conditionalObjectStore(modified time.Time) *fakeObjectStore {
 		newRangeReaderFunc: func(
 			context.Context,
 			string,
-			int64,
-			int64,
+			objectByteRange,
 		) (objectRead, error) {
 			return objectRead{
 				body:          io.NopCloser(strings.NewReader("2345")),

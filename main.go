@@ -40,6 +40,18 @@ type objectWritePlan struct {
 	created bool
 }
 
+type uploadResult struct {
+	size          int64
+	digest        []byte
+	alreadyExists bool
+}
+
+type uploadExpectation struct {
+	size    int64
+	digest  []byte
+	options objectWriteOptions
+}
+
 const (
 	gcsUploadChunkAlignment = 256 * 1024
 	gcsDefaultUploadChunk   = 16 * 1024 * 1024
@@ -48,135 +60,180 @@ const (
 func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	objectPath := req.URL.Path[1:]
 
-	ctx := req.Context()
 	switch req.Method {
 	case http.MethodHead:
-		metadata, err := s.store.attributes(ctx, objectPath)
-		if err != nil {
-			writeObjectReadError(w, err)
-			return
-		}
-		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
-		w.Header().Set("Accept-Ranges", "bytes")
-		if status := readPreconditionStatus(req, metadata); status != 0 {
-			writePreconditionResponse(w, status)
-			return
-		}
+		s.serveHead(w, req, objectPath)
 	case http.MethodGet:
-		object, partial, err := s.readObject(
-			ctx,
-			objectPath,
-			req.Header.Get("Range"),
-			req.Header.Get("If-Range"),
-		)
-		if err != nil {
-			if errors.Is(err, errRangeNotSatisfiable) {
-				s.writeRangeError(w, req, objectPath)
-				return
-			}
-			writeObjectReadError(w, err)
-			return
-		}
-		defer func() {
-			if err := object.body.Close(); err != nil {
-				log.Println(err)
-			}
-		}()
-
-		setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
-		if status := readPreconditionStatus(req, object.metadata); status != 0 {
-			writePreconditionResponse(w, status)
-			return
-		}
-		if !object.metadata.decompressed {
-			w.Header().Set("Accept-Ranges", "bytes")
-			if partial {
-				setPartialContentHeaders(w.Header(), object)
-				w.WriteHeader(http.StatusPartialContent)
-			}
-		}
-		if _, err := copyStream(w, object.body); err != nil {
-			log.Println(err)
-		}
+		s.serveGet(w, req, objectPath)
 	case http.MethodPut:
-		plan, status, err := s.writePlanForRequest(ctx, objectPath, req)
-		if err != nil {
-			writeObjectReadError(w, err)
-			return
-		}
-		if status != 0 {
-			writePreconditionResponse(w, status)
-			return
-		}
-
-		wc := s.store.newWriter(ctx, objectPath, plan.options)
-		digest := sizedHash{Hash: sha256.New()}
-		bodyReader := &readErrorRecorder{reader: req.Body}
-		body := io.TeeReader(bodyReader, &digest)
-		writer := &writeErrorRecorder{writer: wc}
-
-		if _, err := copyStream(writer, body); err != nil {
-			if bodyReader.err != nil {
-				wc.abort()
-				uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, bodyReader.err)
-				writeObjectWriteError(w, uploadErr)
-				return
-			}
-			if writer.err == nil {
-				wc.abort()
-				uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
-				writeObjectWriteError(w, uploadErr)
-				return
-			}
-
-			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
-			uploadErr = errors.Join(uploadErr, wc.Close())
-			if !errors.Is(uploadErr, errObjectAlreadyExists) {
-				writeObjectWriteError(w, uploadErr)
-				return
-			}
-
-			if _, err := copyStream(io.Discard, body); err != nil {
-				hashErr := fmt.Errorf("finish hashing upload %q: %w", objectPath, err)
-				writeObjectWriteError(w, hashErr)
-				return
-			}
-			s.writeExistingUploadResponse(
-				w,
-				ctx,
-				objectPath,
-				digest.size,
-				digest.Sum(nil),
-				plan.options,
-			)
-			return
-		}
-		if err := wc.Close(); err != nil {
-			if errors.Is(err, errObjectAlreadyExists) {
-				s.writeExistingUploadResponse(
-					w,
-					ctx,
-					objectPath,
-					digest.size,
-					digest.Sum(nil),
-					plan.options,
-				)
-				return
-			}
-
-			writeObjectWriteError(w, err)
-			return
-		}
-
-		if plan.created {
-			w.WriteHeader(http.StatusCreated)
-		}
-		writeUploadSuccess(w)
+		s.servePut(w, req, objectPath)
 	default:
 		w.Header().Set("Allow", "GET, HEAD, PUT")
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
 	}
+}
+
+func (s BucketProxy) serveHead(
+	w http.ResponseWriter,
+	req *http.Request,
+	objectPath string,
+) {
+	metadata, err := s.store.attributes(req.Context(), objectPath)
+	if err != nil {
+		writeObjectReadError(w, err)
+		return
+	}
+	setObjectResponseHeaders(w.Header(), metadata, metadata.size)
+	w.Header().Set("Accept-Ranges", "bytes")
+	if status := readPreconditionStatus(req, metadata); status != 0 {
+		writePreconditionResponse(w, status)
+	}
+}
+
+func (s BucketProxy) serveGet(
+	w http.ResponseWriter,
+	req *http.Request,
+	objectPath string,
+) {
+	object, partial, err := s.readObject(req, objectPath)
+	if err != nil {
+		if errors.Is(err, errRangeNotSatisfiable) {
+			s.writeRangeError(w, req, objectPath)
+			return
+		}
+		writeObjectReadError(w, err)
+		return
+	}
+	defer func() {
+		if err := object.body.Close(); err != nil {
+			log.Println(err)
+		}
+	}()
+
+	setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
+	if status := readPreconditionStatus(req, object.metadata); status != 0 {
+		writePreconditionResponse(w, status)
+		return
+	}
+	if !object.metadata.decompressed {
+		w.Header().Set("Accept-Ranges", "bytes")
+		if partial {
+			setPartialContentHeaders(w.Header(), object)
+			w.WriteHeader(http.StatusPartialContent)
+		}
+	}
+	if _, err := copyStream(w, object.body); err != nil {
+		log.Println(err)
+	}
+}
+
+func (s BucketProxy) servePut(
+	w http.ResponseWriter,
+	req *http.Request,
+	objectPath string,
+) {
+	ctx := req.Context()
+	plan, status, err := s.writePlanForRequest(req, objectPath)
+	if err != nil {
+		writeObjectReadError(w, err)
+		return
+	}
+	if status != 0 {
+		writePreconditionResponse(w, status)
+		return
+	}
+
+	writer := s.store.newWriter(ctx, objectPath, plan.options)
+	upload, err := streamUpload(objectPath, writer, req.Body)
+	if err != nil {
+		writeObjectWriteError(w, err)
+		return
+	}
+	if upload.alreadyExists {
+		want := uploadExpectation{
+			size:    upload.size,
+			digest:  upload.digest,
+			options: plan.options,
+		}
+		s.writeExistingUploadResponse(w, ctx, objectPath, want)
+		return
+	}
+
+	if plan.created {
+		w.WriteHeader(http.StatusCreated)
+	}
+	writeUploadSuccess(w)
+}
+
+func streamUpload(
+	objectPath string,
+	wc objectWriter,
+	source io.Reader,
+) (uploadResult, error) {
+	digest := sizedHash{Hash: sha256.New()}
+	bodyReader := &readErrorRecorder{reader: source}
+	body := io.TeeReader(bodyReader, &digest)
+	writer := &writeErrorRecorder{writer: wc}
+
+	_, copyErr := copyStream(writer, body)
+	if copyErr == nil {
+		closeErr := wc.Close()
+		return completedUploadResult(&digest, closeErr)
+	}
+
+	if bodyReader.err != nil {
+		wc.abort()
+		return uploadResult{}, fmt.Errorf(
+			"stream upload %q: %w",
+			objectPath,
+			bodyReader.err,
+		)
+	}
+	if writer.err == nil {
+		wc.abort()
+		return uploadResult{}, fmt.Errorf(
+			"stream upload %q: %w",
+			objectPath,
+			copyErr,
+		)
+	}
+
+	uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, copyErr)
+	uploadErr = errors.Join(uploadErr, wc.Close())
+	if !errors.Is(uploadErr, errObjectAlreadyExists) {
+		return uploadResult{}, uploadErr
+	}
+
+	if _, err := copyStream(io.Discard, body); err != nil {
+		return uploadResult{}, fmt.Errorf(
+			"finish hashing upload %q: %w",
+			objectPath,
+			err,
+		)
+	}
+
+	return uploadResult{
+		size:          digest.size,
+		digest:        digest.Sum(nil),
+		alreadyExists: true,
+	}, nil
+}
+
+func completedUploadResult(digest *sizedHash, closeErr error) (uploadResult, error) {
+	result := uploadResult{
+		size:   digest.size,
+		digest: digest.Sum(nil),
+	}
+	if closeErr == nil {
+		return result, nil
+	}
+	if errors.Is(closeErr, errObjectAlreadyExists) {
+		result.alreadyExists = true
+		return result, nil
+	}
+
+	return uploadResult{}, closeErr
 }
 
 type readErrorRecorder struct {
@@ -232,11 +289,9 @@ func (s BucketProxy) writeExistingUploadResponse(
 	w http.ResponseWriter,
 	ctx context.Context,
 	objectPath string,
-	size int64,
-	digest []byte,
-	options objectWriteOptions,
+	want uploadExpectation,
 ) {
-	identical, err := s.objectMatches(ctx, objectPath, size, digest, options)
+	identical, err := s.objectMatches(ctx, objectPath, want)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -255,9 +310,7 @@ func (s BucketProxy) writeExistingUploadResponse(
 func (s BucketProxy) objectMatches(
 	ctx context.Context,
 	objectPath string,
-	wantSize int64,
-	wantDigest []byte,
-	wantOptions objectWriteOptions,
+	want uploadExpectation,
 ) (bool, error) {
 	object, err := s.store.newReader(ctx, objectPath)
 	if err != nil {
@@ -286,9 +339,9 @@ func (s BucketProxy) objectMatches(
 		)
 	}
 
-	return size == wantSize &&
-		bytes.Equal(digest.Sum(nil), wantDigest) &&
-		objectMetadataMatchesWriteOptions(object.metadata, wantOptions), nil
+	return size == want.size &&
+		bytes.Equal(digest.Sum(nil), want.digest) &&
+		objectMetadataMatchesWriteOptions(object.metadata, want.options), nil
 }
 
 func objectMetadataMatchesWriteOptions(
@@ -316,9 +369,11 @@ func writeUploadSuccess(w http.ResponseWriter) {
 }
 
 func (s BucketProxy) readObject(
-	ctx context.Context,
-	objectPath, rangeHeader, ifRange string,
+	req *http.Request,
+	objectPath string,
 ) (objectRead, bool, error) {
+	ctx := req.Context()
+	rangeHeader := req.Header.Get("Range")
 	if rangeHeader == "" {
 		object, err := s.store.newReader(ctx, objectPath)
 		return object, false, err
@@ -330,18 +385,14 @@ func (s BucketProxy) readObject(
 			object, readErr := s.store.newReader(ctx, objectPath)
 			return object, false, readErr
 		}
-		return s.readAfterRangeFailure(ctx, objectPath, ifRange, err)
+		return s.readAfterRangeFailure(req, objectPath, err)
 	}
 
-	object, err := s.store.newRangeReader(
-		ctx,
-		objectPath,
-		byteRange.offset,
-		byteRange.length,
-	)
+	object, err := s.store.newRangeReader(ctx, objectPath, byteRange)
 	if err != nil {
-		return s.readAfterRangeFailure(ctx, objectPath, ifRange, err)
+		return s.readAfterRangeFailure(req, objectPath, err)
 	}
+	ifRange := req.Header.Get("If-Range")
 	if ifRange == "" || ifRangeMatches(ifRange, object.metadata) {
 		return object, true, nil
 	}
@@ -359,15 +410,16 @@ func (s BucketProxy) readObject(
 }
 
 func (s BucketProxy) readAfterRangeFailure(
-	ctx context.Context,
-	objectPath, ifRange string,
+	req *http.Request,
+	objectPath string,
 	rangeErr error,
 ) (objectRead, bool, error) {
+	ifRange := req.Header.Get("If-Range")
 	if ifRange == "" {
 		return objectRead{}, false, rangeErr
 	}
 
-	metadata, err := s.store.attributes(ctx, objectPath)
+	metadata, err := s.store.attributes(req.Context(), objectPath)
 	if err != nil {
 		return objectRead{}, false, err
 	}
@@ -375,7 +427,7 @@ func (s BucketProxy) readAfterRangeFailure(
 		return objectRead{}, false, rangeErr
 	}
 
-	object, err := s.store.newReader(ctx, objectPath)
+	object, err := s.store.newReader(req.Context(), objectPath)
 	return object, false, err
 }
 
@@ -420,12 +472,11 @@ func writeObjectWriteError(w http.ResponseWriter, err error) {
 }
 
 func (s BucketProxy) writePlanForRequest(
-	ctx context.Context,
-	objectPath string,
 	req *http.Request,
+	objectPath string,
 ) (objectWritePlan, int, error) {
 	options := writeOptionsFromRequest(req)
-	metadata, err := s.store.attributes(ctx, objectPath)
+	metadata, err := s.store.attributes(req.Context(), objectPath)
 	exists := true
 	if errors.Is(err, storage.ErrObjectNotExist) {
 		exists = false
@@ -438,12 +489,6 @@ func (s BucketProxy) writePlanForRequest(
 		options: options,
 		created: !exists,
 	}
-	if !hasWritePreconditions(req.Header) {
-		plan.options.conditions.doesNotExist = true
-		plan.options.reuseExisting = true
-		return plan, 0, nil
-	}
-
 	status, applied := writePreconditionStatus(req.Header, metadata, exists)
 	if status != 0 {
 		return plan, status, nil
@@ -522,12 +567,16 @@ func run(
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}
+	log.Print(startupLogMessage(buildVersion, addr, bucketName))
+
+	return serveUntilShutdown(ctx, server)
+}
+
+func serveUntilShutdown(ctx context.Context, server *http.Server) error {
 	serverErr := make(chan error, 1)
 	go func() {
 		serverErr <- server.ListenAndServe()
 	}()
-
-	log.Print(startupLogMessage(buildVersion, addr, bucketName))
 
 	select {
 	case err := <-serverErr:

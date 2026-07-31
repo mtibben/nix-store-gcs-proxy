@@ -38,12 +38,6 @@ func readPreconditionStatus(req *http.Request, metadata objectMetadata) int {
 	return 0
 }
 
-func hasWritePreconditions(header http.Header) bool {
-	return len(header.Values("If-Match")) > 0 ||
-		len(header.Values("If-None-Match")) > 0 ||
-		len(header.Values("If-Unmodified-Since")) > 0
-}
-
 func writePreconditionStatus(
 	header http.Header,
 	metadata objectMetadata,
@@ -103,28 +97,8 @@ func checkIfMatch(header http.Header, currentETag string) conditionResult {
 	if len(values) == 0 {
 		return conditionNotPresent
 	}
-
-	for value := strings.Join(values, ","); value != ""; {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			break
-		}
-		if value[0] == ',' {
-			value = value[1:]
-			continue
-		}
-		if value[0] == '*' {
-			return conditionTrue
-		}
-
-		entityTag, remaining := scanEntityTag(value)
-		if entityTag == "" {
-			break
-		}
-		if strongETagMatches(entityTag, currentETag) {
-			return conditionTrue
-		}
-		value = remaining
+	if entityTagListMatches(values, currentETag, strongETagMatches) {
+		return conditionTrue
 	}
 
 	return conditionFalse
@@ -152,28 +126,8 @@ func checkIfNoneMatch(header http.Header, currentETag string) conditionResult {
 	if len(values) == 0 {
 		return conditionNotPresent
 	}
-
-	for value := strings.Join(values, ","); value != ""; {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			break
-		}
-		if value[0] == ',' {
-			value = value[1:]
-			continue
-		}
-		if value[0] == '*' {
-			return conditionFalse
-		}
-
-		entityTag, remaining := scanEntityTag(value)
-		if entityTag == "" {
-			break
-		}
-		if weakETagMatches(entityTag, currentETag) {
-			return conditionFalse
-		}
-		value = remaining
+	if entityTagListMatches(values, currentETag, weakETagMatches) {
+		return conditionFalse
 	}
 
 	return conditionTrue
@@ -210,6 +164,37 @@ func ifRangeMatches(value string, metadata objectMetadata) bool {
 	// GCS exposes the current update time but not enough revision history to
 	// prove that an HTTP-date is a strong validator. Treat date validators as
 	// stale so range resumes cannot combine bytes from different generations.
+	return false
+}
+
+func entityTagListMatches(
+	values []string,
+	currentETag string,
+	matches func(string, string) bool,
+) bool {
+	for value := strings.Join(values, ","); value != ""; {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			break
+		}
+		if value[0] == ',' {
+			value = value[1:]
+			continue
+		}
+		if value[0] == '*' {
+			return true
+		}
+
+		entityTag, remaining := scanEntityTag(value)
+		if entityTag == "" {
+			break
+		}
+		if matches(entityTag, currentETag) {
+			return true
+		}
+		value = remaining
+	}
+
 	return false
 }
 

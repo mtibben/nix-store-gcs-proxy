@@ -61,7 +61,7 @@ func (c objectWriteConditions) toGCSConditions() storage.Conditions {
 type objectStore interface {
 	attributes(context.Context, string) (objectMetadata, error)
 	newReader(context.Context, string) (objectRead, error)
-	newRangeReader(context.Context, string, int64, int64) (objectRead, error)
+	newRangeReader(context.Context, string, objectByteRange) (objectRead, error)
 	newWriter(context.Context, string, objectWriteOptions) objectWriter
 }
 
@@ -132,14 +132,14 @@ func (s *gcsObjectStore) newReader(
 func (s *gcsObjectStore) newRangeReader(
 	ctx context.Context,
 	objectName string,
-	offset, length int64,
+	byteRange objectByteRange,
 ) (objectRead, error) {
 	object, metadata, err := s.objectForRead(ctx, objectName)
 	if err != nil {
 		return objectRead{}, err
 	}
 
-	reader, err := object.NewRangeReader(ctx, offset, length)
+	reader, err := object.NewRangeReader(ctx, byteRange.offset, byteRange.length)
 	if err != nil {
 		var apiErr *googleapi.Error
 		if errors.As(err, &apiErr) &&

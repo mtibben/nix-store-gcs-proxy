@@ -155,13 +155,14 @@ func TestBucketProxyServesByteRanges(t *testing.T) {
 				newRangeReaderFunc: func(
 					_ context.Context,
 					_ string,
-					offset, length int64,
+					byteRange objectByteRange,
 				) (objectRead, error) {
-					if offset != test.wantOffset {
-						t.Errorf("offset = %d, want %d", offset, test.wantOffset)
+					wantRange := objectByteRange{
+						offset: test.wantOffset,
+						length: test.wantLength,
 					}
-					if length != test.wantLength {
-						t.Errorf("length = %d, want %d", length, test.wantLength)
+					if byteRange != wantRange {
+						t.Errorf("byte range = %+v, want %+v", byteRange, wantRange)
 					}
 
 					return objectRead{
@@ -312,8 +313,7 @@ func TestBucketProxyReportsUnsatisfiableGCSRange(t *testing.T) {
 		newRangeReaderFunc: func(
 			context.Context,
 			string,
-			int64,
-			int64,
+			objectByteRange,
 		) (objectRead, error) {
 			return objectRead{}, errRangeNotSatisfiable
 		},
@@ -342,8 +342,7 @@ func TestBucketProxyIgnoresRangeAfterGCSDecompression(t *testing.T) {
 		newRangeReaderFunc: func(
 			context.Context,
 			string,
-			int64,
-			int64,
+			objectByteRange,
 		) (objectRead, error) {
 			return objectRead{
 				body: io.NopCloser(strings.NewReader("cache data")),
@@ -445,7 +444,7 @@ func assertObjectHeaders(t *testing.T, header http.Header, modified time.Time) {
 type fakeObjectStore struct {
 	attributesFunc     func(context.Context, string) (objectMetadata, error)
 	newReaderFunc      func(context.Context, string) (objectRead, error)
-	newRangeReaderFunc func(context.Context, string, int64, int64) (objectRead, error)
+	newRangeReaderFunc func(context.Context, string, objectByteRange) (objectRead, error)
 	newWriterFunc      func(context.Context, string, objectWriteOptions) objectWriter
 }
 
@@ -474,13 +473,13 @@ func (s *fakeObjectStore) newReader(
 func (s *fakeObjectStore) newRangeReader(
 	ctx context.Context,
 	objectName string,
-	offset, length int64,
+	byteRange objectByteRange,
 ) (objectRead, error) {
 	if s.newRangeReaderFunc == nil {
 		panic("unexpected newRangeReader call")
 	}
 
-	return s.newRangeReaderFunc(ctx, objectName, offset, length)
+	return s.newRangeReaderFunc(ctx, objectName, byteRange)
 }
 
 func (s *fakeObjectStore) newWriter(

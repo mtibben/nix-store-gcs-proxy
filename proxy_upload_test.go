@@ -238,6 +238,57 @@ func TestBucketProxyReusesIdenticalConcurrentUpload(t *testing.T) {
 	}
 }
 
+func TestBucketProxyKeepsCollisionTargetStableWhileReadingBody(t *testing.T) {
+	t.Parallel()
+
+	const content = "cache data"
+	comparedObject := ""
+	type contextKey struct{}
+	key := contextKey{}
+	originalContext := context.WithValue(context.Background(), key, "original")
+	comparedContext := ""
+	store := concurrentUploadStore(t, content)
+	store.newReaderFunc = func(ctx context.Context, objectName string) (objectRead, error) {
+		comparedObject = objectName
+		contextValue, ok := ctx.Value(key).(string)
+		if !ok {
+			t.Fatal("comparison context did not contain the expected value")
+		}
+		comparedContext = contextValue
+		return objectRead{
+			body: io.NopCloser(strings.NewReader(content)),
+		}, nil
+	}
+	request := httptest.NewRequestWithContext(
+		originalContext,
+		http.MethodPut,
+		"/example.nar",
+		nil,
+	)
+	body := strings.NewReader(content)
+	request.Body = io.NopCloser(readerFunc(func(data []byte) (int, error) {
+		request.URL.Path = "/different.nar"
+		*request = *request.WithContext(
+			context.WithValue(context.Background(), key, "different"),
+		)
+		return body.Read(data)
+	}))
+	request.ContentLength = int64(len(content))
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if comparedObject != "example.nar" {
+		t.Errorf("compared object = %q, want example.nar", comparedObject)
+	}
+	if comparedContext != "original" {
+		t.Errorf("compared context = %q, want original", comparedContext)
+	}
+}
+
 func TestBucketProxyReusesIdenticalConcurrentUploadAfterWriteFailure(t *testing.T) {
 	t.Parallel()
 
@@ -361,6 +412,59 @@ func TestReadErrorRecorderAcceptsDataWithEOF(t *testing.T) {
 	}
 	if reader.err != nil {
 		t.Errorf("recorded error = %v, want nil", reader.err)
+	}
+}
+
+func TestStreamUploadAbortsAfterShortWriteWithoutError(t *testing.T) {
+	t.Parallel()
+
+	writer := &shortWritingObjectWriter{}
+
+	result, err := streamUpload(
+		"example.nar",
+		writer,
+		strings.NewReader("cache data"),
+	)
+
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("error = %v, want short write", err)
+	}
+	if result.size != 0 || len(result.digest) != 0 || result.alreadyExists {
+		t.Errorf("result = %+v, want empty result", result)
+	}
+	if !writer.aborted {
+		t.Error("short-writing writer was not aborted")
+	}
+	if writer.closed {
+		t.Error("short-writing writer was closed")
+	}
+}
+
+func TestStreamUploadReportsReadFailureWhileFinishingCollisionHash(t *testing.T) {
+	t.Parallel()
+
+	writer := &writeFailingExistingObjectWriter{}
+	reader := &readThenErrorReader{
+		content: "partial",
+		err:     errUploadRead,
+	}
+
+	result, err := streamUpload("example.nar", writer, reader)
+
+	if !errors.Is(err, errUploadRead) {
+		t.Errorf("error = %v, want upload read error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "finish hashing upload") {
+		t.Errorf("error = %q, want finish hashing context", err)
+	}
+	if result.size != 0 || len(result.digest) != 0 || result.alreadyExists {
+		t.Errorf("result = %+v, want empty result", result)
+	}
+	if !writer.closed {
+		t.Error("failed writer was not closed to recover its storage error")
+	}
+	if writer.aborted {
+		t.Error("failed writer was aborted before its storage error was recovered")
 	}
 }
 
@@ -653,6 +757,27 @@ func (r *singleReadResultReader) Read(data []byte) (int, error) {
 	return copy(data, r.content), r.err
 }
 
+type readThenErrorReader struct {
+	content string
+	err     error
+	read    bool
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(data []byte) (int, error) {
+	return f(data)
+}
+
+func (r *readThenErrorReader) Read(data []byte) (int, error) {
+	if r.read {
+		return 0, r.err
+	}
+	r.read = true
+
+	return copy(data, r.content), nil
+}
+
 type trackingObjectWriter struct {
 	bytes.Buffer
 	aborted  bool
@@ -666,6 +791,27 @@ func (w *trackingObjectWriter) Close() error {
 }
 
 func (w *trackingObjectWriter) abort() {
+	w.aborted = true
+}
+
+type shortWritingObjectWriter struct {
+	aborted bool
+	closed  bool
+}
+
+func (*shortWritingObjectWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	return len(data) - 1, nil
+}
+
+func (w *shortWritingObjectWriter) Close() error {
+	w.closed = true
+	return nil
+}
+
+func (w *shortWritingObjectWriter) abort() {
 	w.aborted = true
 }
 
