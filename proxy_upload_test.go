@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -141,10 +142,16 @@ func TestBucketProxyUsesPutCreationStatus(t *testing.T) {
 					return objectMetadata{}, nil
 				},
 				newWriterFunc: func(
-					context.Context,
-					string,
-					objectWriteOptions,
+					_ context.Context,
+					_ string,
+					options objectWriteOptions,
 				) objectWriter {
+					if !options.conditions.doesNotExist {
+						t.Error("ordinary upload was not create-only")
+					}
+					if !options.reuseExisting {
+						t.Error("ordinary upload did not allow identical reuse")
+					}
 					return &trackingObjectWriter{}
 				},
 			}
@@ -205,6 +212,48 @@ func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 	}
 }
 
+func TestBucketProxyReusesIdenticalConcurrentUpload(t *testing.T) {
+	t.Parallel()
+
+	const content = "cache data"
+	store := concurrentUploadStore(t, content)
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader(content),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if body := response.Body.String(); body != "OK" {
+		t.Errorf("body = %q, want OK", body)
+	}
+}
+
+func TestBucketProxyRejectsDifferentConcurrentUpload(t *testing.T) {
+	t.Parallel()
+
+	store := concurrentUploadStore(t, "different cache data")
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader("cache data"),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusConflict)
+	}
+}
+
 func TestBucketProxyHonorsWritePreconditions(t *testing.T) {
 	t.Parallel()
 
@@ -225,6 +274,7 @@ func TestBucketProxyHonorsWritePreconditions(t *testing.T) {
 		wantStatus     int
 		wantWrite      bool
 		wantConditions objectWriteConditions
+		wantReuse      bool
 	}{
 		"matching If-Match": {
 			headers: map[string]string{
@@ -327,6 +377,13 @@ func TestBucketProxyHonorsWritePreconditions(t *testing.T) {
 							"write conditions = %+v, want %+v",
 							options.conditions,
 							test.wantConditions,
+						)
+					}
+					if options.reuseExisting != test.wantReuse {
+						t.Errorf(
+							"reuse existing = %t, want %t",
+							options.reuseExisting,
+							test.wantReuse,
 						)
 					}
 					return writer
@@ -459,3 +516,38 @@ func (w *trackingObjectWriter) Close() error {
 func (w *trackingObjectWriter) abort() {
 	w.aborted = true
 }
+
+func concurrentUploadStore(t *testing.T, existingContent string) *fakeObjectStore {
+	t.Helper()
+
+	return &fakeObjectStore{
+		attributesFunc: func(context.Context, string) (objectMetadata, error) {
+			return objectMetadata{}, storage.ErrObjectNotExist
+		},
+		newWriterFunc: func(
+			_ context.Context,
+			_ string,
+			options objectWriteOptions,
+		) objectWriter {
+			if !options.reuseExisting {
+				t.Error("concurrent upload did not allow identical reuse")
+			}
+			return &existingObjectWriter{}
+		},
+		newReaderFunc: func(context.Context, string) (objectRead, error) {
+			return objectRead{
+				body: io.NopCloser(strings.NewReader(existingContent)),
+			}, nil
+		},
+	}
+}
+
+type existingObjectWriter struct {
+	bytes.Buffer
+}
+
+func (*existingObjectWriter) Close() error {
+	return errObjectAlreadyExists
+}
+
+func (*existingObjectWriter) abort() {}

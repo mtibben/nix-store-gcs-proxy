@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -106,14 +109,43 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		wc := s.store.newWriter(ctx, objectPath, plan.options)
+		digest := sha256.New()
 
-		if _, err := copyStream(wc, req.Body); err != nil {
+		written, err := copyStream(io.MultiWriter(wc, digest), req.Body)
+		if err != nil {
 			wc.abort()
 			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
 			writeObjectWriteError(w, uploadErr)
 			return
 		}
 		if err := wc.Close(); err != nil {
+			if errors.Is(err, errObjectAlreadyExists) {
+				identical, compareErr := s.objectMatches(
+					ctx,
+					objectPath,
+					written,
+					digest.Sum(nil),
+				)
+				if compareErr != nil {
+					log.Println(compareErr)
+					http.Error(w, compareErr.Error(), http.StatusBadGateway)
+					return
+				}
+				if identical {
+					writeUploadSuccess(w)
+					return
+				}
+
+				conflictErr := fmt.Errorf(
+					"%w: %q",
+					errObjectContentConflict,
+					objectPath,
+				)
+				log.Println(conflictErr)
+				http.Error(w, conflictErr.Error(), http.StatusConflict)
+				return
+			}
+
 			writeObjectWriteError(w, err)
 			return
 		}
@@ -121,13 +153,53 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if plan.created {
 			w.WriteHeader(http.StatusCreated)
 		}
-		if _, err := fmt.Fprint(w, "OK"); err != nil {
-			log.Println(err)
-		}
+		writeUploadSuccess(w)
 	default:
 		w.Header().Set("Allow", "GET, HEAD, PUT")
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
+	}
+}
+
+func (s BucketProxy) objectMatches(
+	ctx context.Context,
+	objectPath string,
+	wantSize int64,
+	wantDigest []byte,
+) (bool, error) {
+	object, err := s.store.newReader(ctx, objectPath)
+	if err != nil {
+		return false, fmt.Errorf(
+			"read concurrently-created object %q: %w",
+			objectPath,
+			err,
+		)
+	}
+
+	digest := sha256.New()
+	size, copyErr := copyStream(digest, object.body)
+	closeErr := object.body.Close()
+	if copyErr != nil {
+		return false, fmt.Errorf(
+			"hash concurrently-created object %q: %w",
+			objectPath,
+			copyErr,
+		)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf(
+			"close concurrently-created object %q: %w",
+			objectPath,
+			closeErr,
+		)
+	}
+
+	return size == wantSize && bytes.Equal(digest.Sum(nil), wantDigest), nil
+}
+
+func writeUploadSuccess(w http.ResponseWriter) {
+	if _, err := fmt.Fprint(w, "OK"); err != nil {
+		log.Println(err)
 	}
 }
 
@@ -255,12 +327,19 @@ func (s BucketProxy) writePlanForRequest(
 		created: !exists,
 	}
 	if !hasWritePreconditions(req.Header) {
+		plan.options.conditions.doesNotExist = true
+		plan.options.reuseExisting = true
 		return plan, 0, nil
 	}
 
 	status, applied := writePreconditionStatus(req.Header, metadata, exists)
-	if status != 0 || !applied {
+	if status != 0 {
 		return plan, status, nil
+	}
+	if !applied {
+		plan.options.conditions.doesNotExist = true
+		plan.options.reuseExisting = true
+		return plan, 0, nil
 	}
 
 	if exists {
