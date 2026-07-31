@@ -25,25 +25,17 @@ const (
 
 var errBucketNameRequired = errors.New("please specify a bucket name")
 
-func fetchHeader(req *http.Request, key string) (string, bool) {
-	if _, ok := req.Header[key]; ok {
-		return req.Header.Get(key), true
-	}
-	return "", false
-}
-
 type BucketProxy struct {
-	bucket *storage.BucketHandle
+	store objectStore
 }
 
 func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	objectPath := req.URL.Path[1:]
-	object := s.bucket.Object(objectPath)
 
 	ctx := req.Context()
 	switch req.Method {
 	case http.MethodHead:
-		_, err := object.Attrs(ctx)
+		_, err := s.store.attributes(ctx, objectPath)
 		if err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
@@ -53,7 +45,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	case http.MethodGet:
-		rc, err := object.NewReader(ctx)
+		object, err := s.store.newReader(ctx, objectPath)
 		if err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
@@ -63,34 +55,17 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		defer func() {
-			if err := rc.Close(); err != nil {
+			if err := object.body.Close(); err != nil {
 				log.Println(err)
 			}
 		}()
 
-		if _, err := io.Copy(w, rc); err != nil {
+		if _, err := io.Copy(w, object.body); err != nil {
 			log.Println(err)
 		}
 	case http.MethodPut:
 		// Write the object to GCS
-		wc := object.NewWriter(ctx)
-
-		// Copy the supported headers over from the original request
-		if val, ok := fetchHeader(req, "Content-Type"); ok {
-			wc.ContentType = val
-		}
-		if val, ok := fetchHeader(req, "Content-Language"); ok {
-			wc.ContentLanguage = val
-		}
-		if val, ok := fetchHeader(req, "Content-Encoding"); ok {
-			wc.ContentEncoding = val
-		}
-		if val, ok := fetchHeader(req, "Content-Disposition"); ok {
-			wc.ContentDisposition = val
-		}
-		if val, ok := fetchHeader(req, "Cache-Control"); ok {
-			wc.CacheControl = val
-		}
+		wc := s.store.newWriter(ctx, objectPath, writeOptionsFromRequest(req))
 
 		if _, err := io.Copy(wc, req.Body); err != nil {
 			log.Println(err)
@@ -112,6 +87,16 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func writeOptionsFromRequest(req *http.Request) objectWriteOptions {
+	return objectWriteOptions{
+		contentType:        req.Header.Get("Content-Type"),
+		contentLanguage:    req.Header.Get("Content-Language"),
+		contentEncoding:    req.Header.Get("Content-Encoding"),
+		contentDisposition: req.Header.Get("Content-Disposition"),
+		cacheControl:       req.Header.Get("Cache-Control"),
+	}
+}
+
 // Start the HTTP server
 func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
@@ -128,11 +113,12 @@ func run(parentCtx context.Context, addr, bucketName string) (runErr error) {
 	}()
 
 	bucket := client.Bucket(bucketName)
+	store := newGCSObjectStore(bucket)
 
 	server := &http.Server{
 		Addr: addr,
 		Handler: newHTTPHandler(
-			BucketProxy{bucket},
+			BucketProxy{store: store},
 			newCacheReadinessCheck(bucket),
 			healthReadinessTimeout,
 		),
