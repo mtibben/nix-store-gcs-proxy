@@ -159,6 +159,21 @@ func TestClassifyObjectWriteErrorMarksPreconditionFailures(t *testing.T) {
 	}
 }
 
+func TestClassifyObjectWriteErrorMarksCreateOnlyConflicts(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &googleapi.Error{Code: http.StatusPreconditionFailed}
+	wrapped := fmt.Errorf("close object writer: %w", apiErr)
+	err := classifyObjectWriteErrorAs(wrapped, errObjectAlreadyExists)
+
+	if !errors.Is(err, errObjectAlreadyExists) {
+		t.Errorf("error = %v, want errObjectAlreadyExists", err)
+	}
+	if !errors.Is(err, apiErr) {
+		t.Errorf("error = %v, want wrapped API error", err)
+	}
+}
+
 func TestObjectWriteConditionsConvertToGCSConditions(t *testing.T) {
 	t.Parallel()
 
