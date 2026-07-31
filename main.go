@@ -46,8 +46,17 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
 		w.Header().Set("Accept-Ranges", "bytes")
+		if status := readPreconditionStatus(req, metadata); status != 0 {
+			writeReadPreconditionResponse(w, status)
+			return
+		}
 	case http.MethodGet:
-		object, partial, err := s.readObject(ctx, objectPath, req.Header.Get("Range"))
+		object, partial, err := s.readObject(
+			ctx,
+			objectPath,
+			req.Header.Get("Range"),
+			req.Header.Get("If-Range"),
+		)
 		if err != nil {
 			if errors.Is(err, errRangeNotSatisfiable) {
 				if errors.Is(err, errInvalidByteRange) {
@@ -71,6 +80,10 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}()
 
 		setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
+		if status := readPreconditionStatus(req, object.metadata); status != 0 {
+			writeReadPreconditionResponse(w, status)
+			return
+		}
 		if !object.metadata.decompressed {
 			w.Header().Set("Accept-Ranges", "bytes")
 			if partial {
@@ -107,11 +120,22 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func (s BucketProxy) readObject(
 	ctx context.Context,
-	objectPath, rangeHeader string,
+	objectPath, rangeHeader, ifRange string,
 ) (objectRead, bool, error) {
 	if rangeHeader == "" {
 		object, err := s.store.newReader(ctx, objectPath)
 		return object, false, err
+	}
+
+	if ifRange != "" {
+		metadata, err := s.store.attributes(ctx, objectPath)
+		if err != nil {
+			return objectRead{}, false, err
+		}
+		if !ifRangeMatches(ifRange, metadata) {
+			object, err := s.store.newReader(ctx, objectPath)
+			return object, false, err
+		}
 	}
 
 	byteRange, err := parseObjectByteRange(rangeHeader)
