@@ -46,7 +46,12 @@ type objectStore interface {
 	attributes(context.Context, string) (objectMetadata, error)
 	newReader(context.Context, string) (objectRead, error)
 	newRangeReader(context.Context, string, int64, int64) (objectRead, error)
-	newWriter(context.Context, string, objectWriteOptions) io.WriteCloser
+	newWriter(context.Context, string, objectWriteOptions) objectWriter
+}
+
+type objectWriter interface {
+	io.WriteCloser
+	abort()
 }
 
 type gcsObjectStore struct {
@@ -119,8 +124,9 @@ func (s *gcsObjectStore) newWriter(
 	ctx context.Context,
 	objectName string,
 	options objectWriteOptions,
-) io.WriteCloser {
-	writer := s.bucket.Object(objectName).NewWriter(ctx)
+) objectWriter {
+	writerContext, cancelWriter := context.WithCancel(ctx)
+	writer := s.bucket.Object(objectName).NewWriter(writerContext)
 	writer.ContentType = options.contentType
 	writer.ContentLanguage = options.contentLanguage
 	writer.ContentEncoding = options.contentEncoding
@@ -131,8 +137,9 @@ func (s *gcsObjectStore) newWriter(
 	}
 
 	return &gcsObjectWriter{
-		objectName: objectName,
-		writer:     writer,
+		objectName:   objectName,
+		writer:       writer,
+		cancelWriter: cancelWriter,
 	}
 }
 
@@ -155,8 +162,9 @@ func objectReadFromGCSReader(reader *storage.Reader) objectRead {
 }
 
 type gcsObjectWriter struct {
-	objectName string
-	writer     *storage.Writer
+	objectName   string
+	writer       *storage.Writer
+	cancelWriter context.CancelFunc
 }
 
 func (w *gcsObjectWriter) Write(data []byte) (int, error) {
@@ -169,9 +177,15 @@ func (w *gcsObjectWriter) Write(data []byte) (int, error) {
 }
 
 func (w *gcsObjectWriter) Close() error {
+	defer w.cancelWriter()
+
 	if err := w.writer.Close(); err != nil {
 		return fmt.Errorf("close object %q writer: %w", w.objectName, err)
 	}
 
 	return nil
+}
+
+func (w *gcsObjectWriter) abort() {
+	w.cancelWriter()
 }

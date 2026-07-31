@@ -13,6 +13,7 @@ Unreleased
     conditional cache reads
   * reduce memory used by concurrent small uploads while retaining resumable
     16 MiB chunks for large and unknown-size objects
+  * abort failed streaming uploads instead of finalizing partial GCS objects
   * coalesce bursts of GCS-backed readiness checks with a one-second result
     cache
   * modernize the Nix build and document current flake, upload, cache-consumer,

@@ -104,8 +104,10 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		wc := s.store.newWriter(ctx, objectPath, writeOptionsFromRequest(req))
 
 		if _, err := io.Copy(wc, req.Body); err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			wc.abort()
+			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
+			log.Println(uploadErr)
+			http.Error(w, uploadErr.Error(), http.StatusBadGateway)
 			return
 		}
 		if err := wc.Close(); err != nil {
