@@ -2,17 +2,29 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/urfave/cli"
 	"github.com/urfave/negroni"
 	"google.golang.org/api/option"
 )
+
+const (
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 60 * time.Second
+	serverShutdownTimeout   = 10 * time.Second
+)
+
+var errBucketNameRequired = errors.New("please specify a bucket name")
 
 func fetchHeader(req *http.Request, key string) (string, bool) {
 	if _, ok := req.Header[key]; ok {
@@ -34,7 +46,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case http.MethodHead:
 		_, err := object.Attrs(ctx)
 		if err != nil {
-			if err == storage.ErrObjectNotExist {
+			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
 			} else {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -44,7 +56,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case http.MethodGet:
 		rc, err := object.NewReader(ctx)
 		if err != nil {
-			if err == storage.ErrObjectNotExist {
+			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
 			} else {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -102,13 +114,19 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // Start the HTTP server
-func run(addr, bucketName string) error {
-	ctx := context.Background()
+func run(addr, bucketName string) (runErr error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	client, err := storage.NewClient(ctx, option.WithScopes(storage.ScopeReadWrite))
 	if err != nil {
-		return err
+		return fmt.Errorf("create storage client: %w", err)
 	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close storage client: %w", err))
+		}
+	}()
 
 	bucket := client.Bucket(bucketName)
 
@@ -117,8 +135,47 @@ func run(addr, bucketName string) error {
 	n := negroni.Classic() // Includes some default middlewares
 	n.UseHandler(handler)
 
-	fmt.Println("Starting proxy server on address", addr, "for bucket", bucketName)
-	return http.ListenAndServe(addr, n)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           n,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	log.Printf("Starting proxy server on address %s for bucket %s", addr, bucketName)
+
+	select {
+	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve HTTP: %w", err)
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		serverShutdownTimeout,
+	)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		shutdownErr := fmt.Errorf("shut down HTTP server: %w", err)
+		if err := server.Close(); err != nil {
+			return errors.Join(shutdownErr, fmt.Errorf("close HTTP server: %w", err))
+		}
+		return shutdownErr
+	}
+
+	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP: %w", err)
+	}
+
+	return nil
 }
 
 // Urfave cli action
@@ -126,7 +183,7 @@ func action(c *cli.Context) error {
 	addr := c.String("addr")
 	bucketName := c.String("bucket-name")
 	if bucketName == "" {
-		return fmt.Errorf("please specify a bucket name")
+		return errBucketNameRequired
 	}
 	return run(addr, bucketName)
 }
