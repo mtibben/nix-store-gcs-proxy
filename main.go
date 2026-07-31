@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -109,40 +110,50 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		wc := s.store.newWriter(ctx, objectPath, plan.options)
-		digest := sha256.New()
+		digest := sizedHash{Hash: sha256.New()}
+		body := io.TeeReader(req.Body, &digest)
+		writer := &writeErrorRecorder{writer: wc}
 
-		written, err := copyStream(io.MultiWriter(wc, digest), req.Body)
-		if err != nil {
-			wc.abort()
+		if _, err := copyStream(writer, body); err != nil {
+			if writer.err == nil {
+				wc.abort()
+				uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
+				writeObjectWriteError(w, uploadErr)
+				return
+			}
+
 			uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, err)
-			writeObjectWriteError(w, uploadErr)
+			uploadErr = errors.Join(uploadErr, wc.Close())
+			if !errors.Is(uploadErr, errObjectAlreadyExists) {
+				writeObjectWriteError(w, uploadErr)
+				return
+			}
+
+			if _, err := copyStream(io.Discard, body); err != nil {
+				hashErr := fmt.Errorf("finish hashing upload %q: %w", objectPath, err)
+				writeObjectWriteError(w, hashErr)
+				return
+			}
+			s.writeExistingUploadResponse(
+				w,
+				ctx,
+				objectPath,
+				digest.size,
+				digest.Sum(nil),
+				plan.options,
+			)
 			return
 		}
 		if err := wc.Close(); err != nil {
 			if errors.Is(err, errObjectAlreadyExists) {
-				identical, compareErr := s.objectMatches(
+				s.writeExistingUploadResponse(
+					w,
 					ctx,
 					objectPath,
-					written,
+					digest.size,
 					digest.Sum(nil),
+					plan.options,
 				)
-				if compareErr != nil {
-					log.Println(compareErr)
-					http.Error(w, compareErr.Error(), http.StatusBadGateway)
-					return
-				}
-				if identical {
-					writeUploadSuccess(w)
-					return
-				}
-
-				conflictErr := fmt.Errorf(
-					"%w: %q",
-					errObjectContentConflict,
-					objectPath,
-				)
-				log.Println(conflictErr)
-				http.Error(w, conflictErr.Error(), http.StatusConflict)
 				return
 			}
 
@@ -161,11 +172,64 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+type sizedHash struct {
+	hash.Hash
+	size int64
+}
+
+func (h *sizedHash) Write(data []byte) (int, error) {
+	written, err := h.Hash.Write(data)
+	h.size += int64(written)
+	if err != nil {
+		return written, fmt.Errorf("hash upload: %w", err)
+	}
+	return written, nil
+}
+
+type writeErrorRecorder struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *writeErrorRecorder) Write(data []byte) (int, error) {
+	written, err := w.writer.Write(data)
+	if err != nil {
+		err = fmt.Errorf("write upload: %w", err)
+	}
+	w.err = err
+	return written, err
+}
+
+func (s BucketProxy) writeExistingUploadResponse(
+	w http.ResponseWriter,
+	ctx context.Context,
+	objectPath string,
+	size int64,
+	digest []byte,
+	options objectWriteOptions,
+) {
+	identical, err := s.objectMatches(ctx, objectPath, size, digest, options)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if identical {
+		writeUploadSuccess(w)
+		return
+	}
+
+	conflictErr := fmt.Errorf("%w: %q", errObjectContentConflict, objectPath)
+	log.Println(conflictErr)
+	http.Error(w, conflictErr.Error(), http.StatusConflict)
+}
+
 func (s BucketProxy) objectMatches(
 	ctx context.Context,
 	objectPath string,
 	wantSize int64,
 	wantDigest []byte,
+	wantOptions objectWriteOptions,
 ) (bool, error) {
 	object, err := s.store.newReader(ctx, objectPath)
 	if err != nil {
@@ -194,7 +258,27 @@ func (s BucketProxy) objectMatches(
 		)
 	}
 
-	return size == wantSize && bytes.Equal(digest.Sum(nil), wantDigest), nil
+	return size == wantSize &&
+		bytes.Equal(digest.Sum(nil), wantDigest) &&
+		objectMetadataMatchesWriteOptions(object.metadata, wantOptions), nil
+}
+
+func objectMetadataMatchesWriteOptions(
+	metadata objectMetadata,
+	options objectWriteOptions,
+) bool {
+	// GCS derives Content-Type and may apply a default Cache-Control value when
+	// those request headers are absent, so blank values do not constrain them.
+	contentTypeMatches := options.contentType == "" ||
+		metadata.contentType == options.contentType
+	cacheControlMatches := options.cacheControl == "" ||
+		metadata.cacheControl == options.cacheControl
+
+	return contentTypeMatches &&
+		metadata.contentLanguage == options.contentLanguage &&
+		metadata.contentEncoding == options.contentEncoding &&
+		metadata.contentDisposition == options.contentDisposition &&
+		cacheControlMatches
 }
 
 func writeUploadSuccess(w http.ResponseWriter) {

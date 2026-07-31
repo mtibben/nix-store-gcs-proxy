@@ -235,6 +235,48 @@ func TestBucketProxyReusesIdenticalConcurrentUpload(t *testing.T) {
 	}
 }
 
+func TestBucketProxyReusesIdenticalConcurrentUploadAfterWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("x", gcsDefaultUploadChunk+2*streamCopyBufferSize)
+	writer := &writeFailingExistingObjectWriter{
+		bytesUntilFailure: gcsDefaultUploadChunk,
+	}
+	store := concurrentUploadStore(t, content)
+	store.newWriterFunc = func(
+		_ context.Context,
+		_ string,
+		options objectWriteOptions,
+	) objectWriter {
+		if !options.reuseExisting {
+			t.Error("concurrent upload did not allow identical reuse")
+		}
+		return writer
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader(content),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if body := response.Body.String(); body != "OK" {
+		t.Errorf("body = %q, want OK", body)
+	}
+	if !writer.closed {
+		t.Error("failed writer was not closed to recover its storage error")
+	}
+	if writer.aborted {
+		t.Error("failed writer was aborted before its storage error was recovered")
+	}
+}
+
 func TestBucketProxyRejectsDifferentConcurrentUpload(t *testing.T) {
 	t.Parallel()
 
@@ -245,6 +287,27 @@ func TestBucketProxyRejectsDifferentConcurrentUpload(t *testing.T) {
 		"/example.nar",
 		strings.NewReader("cache data"),
 	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusConflict)
+	}
+}
+
+func TestBucketProxyRejectsConcurrentUploadWithDifferentMetadata(t *testing.T) {
+	t.Parallel()
+
+	const content = "cache data"
+	store := concurrentUploadStore(t, content)
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader(content),
+	)
+	request.Header.Set("Content-Encoding", "gzip")
 	response := httptest.NewRecorder()
 
 	BucketProxy{store: store}.ServeHTTP(response, request)
@@ -551,3 +614,33 @@ func (*existingObjectWriter) Close() error {
 }
 
 func (*existingObjectWriter) abort() {}
+
+var errUploadWrite = errors.New("upload write failed")
+
+type writeFailingExistingObjectWriter struct {
+	bytesUntilFailure int
+	closed            bool
+	aborted           bool
+}
+
+func (w *writeFailingExistingObjectWriter) Write(data []byte) (int, error) {
+	if w.bytesUntilFailure == 0 {
+		return 0, errUploadWrite
+	}
+
+	written := min(len(data), w.bytesUntilFailure)
+	w.bytesUntilFailure -= written
+	if written < len(data) {
+		return written, errUploadWrite
+	}
+	return written, nil
+}
+
+func (w *writeFailingExistingObjectWriter) Close() error {
+	w.closed = true
+	return errObjectAlreadyExists
+}
+
+func (w *writeFailingExistingObjectWriter) abort() {
+	w.aborted = true
+}
