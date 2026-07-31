@@ -299,10 +299,11 @@ func TestBucketProxyHonorsIfRange(t *testing.T) {
 			wantBody:     "cache data",
 			wantFullRead: 1,
 		},
-		"matching date": {
-			ifRange:    modified.Format(http.TimeFormat),
-			wantStatus: http.StatusPartialContent,
-			wantBody:   "2345",
+		"weak matching date": {
+			ifRange:      modified.Format(http.TimeFormat),
+			wantStatus:   http.StatusOK,
+			wantBody:     "cache data",
+			wantFullRead: 1,
 		},
 		"stale date": {
 			ifRange:      modified.Add(-time.Second).Format(http.TimeFormat),

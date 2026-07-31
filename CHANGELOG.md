@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Treat byte-range units case-insensitively and ignore unsupported range requests.
 - Advertise the proxy's supported methods in `405 Method Not Allowed`
   responses.
+- Prevent date-based range resumes from combining different GCS generations.
+- Keep canceled readiness requests from affecting subsequent health probes.
+- Return `201 Created` when `PUT` creates a new cache object.
 
 ## [0.1.0] - 2019-09-04
 

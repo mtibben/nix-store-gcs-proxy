@@ -206,16 +206,11 @@ func ifRangeMatches(value string, metadata objectMetadata) bool {
 	if entityTag != "" {
 		return strongETagMatches(entityTag, objectETag(metadata))
 	}
-	if metadata.lastModified.IsZero() {
-		return false
-	}
 
-	validatorTime, err := http.ParseTime(value)
-	if err != nil {
-		return false
-	}
-
-	return metadata.lastModified.Unix() == validatorTime.Unix()
+	// GCS exposes the current update time but not enough revision history to
+	// prove that an HTTP-date is a strong validator. Treat date validators as
+	// stale so range resumes cannot combine bytes from different generations.
+	return false
 }
 
 func scanEntityTag(value string) (entityTag, remaining string) {

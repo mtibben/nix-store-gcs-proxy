@@ -31,6 +31,11 @@ type BucketProxy struct {
 	store objectStore
 }
 
+type objectWritePlan struct {
+	options objectWriteOptions
+	created bool
+}
+
 const (
 	gcsUploadChunkAlignment = 256 * 1024
 	gcsDefaultUploadChunk   = 16 * 1024 * 1024
@@ -90,7 +95,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			log.Println(err)
 		}
 	case http.MethodPut:
-		options, status, err := s.writeOptionsForRequest(ctx, objectPath, req)
+		plan, status, err := s.writePlanForRequest(ctx, objectPath, req)
 		if err != nil {
 			writeObjectReadError(w, err)
 			return
@@ -100,7 +105,7 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		wc := s.store.newWriter(ctx, objectPath, options)
+		wc := s.store.newWriter(ctx, objectPath, plan.options)
 
 		if _, err := copyStream(wc, req.Body); err != nil {
 			wc.abort()
@@ -113,6 +118,9 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
+		if plan.created {
+			w.WriteHeader(http.StatusCreated)
+		}
 		if _, err := fmt.Fprint(w, "OK"); err != nil {
 			log.Println(err)
 		}
@@ -227,38 +235,42 @@ func writeObjectWriteError(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadGateway)
 }
 
-func (s BucketProxy) writeOptionsForRequest(
+func (s BucketProxy) writePlanForRequest(
 	ctx context.Context,
 	objectPath string,
 	req *http.Request,
-) (objectWriteOptions, int, error) {
+) (objectWritePlan, int, error) {
 	options := writeOptionsFromRequest(req)
-	if !hasWritePreconditions(req.Header) {
-		return options, 0, nil
-	}
-
 	metadata, err := s.store.attributes(ctx, objectPath)
 	exists := true
 	if errors.Is(err, storage.ErrObjectNotExist) {
 		exists = false
 		metadata = objectMetadata{}
 	} else if err != nil {
-		return objectWriteOptions{}, 0, err
+		return objectWritePlan{}, 0, err
+	}
+
+	plan := objectWritePlan{
+		options: options,
+		created: !exists,
+	}
+	if !hasWritePreconditions(req.Header) {
+		return plan, 0, nil
 	}
 
 	status, applied := writePreconditionStatus(req.Header, metadata, exists)
 	if status != 0 || !applied {
-		return options, status, nil
+		return plan, status, nil
 	}
 
 	if exists {
-		options.conditions.generationMatch = metadata.generation
-		options.conditions.metagenerationMatch = metadata.metageneration
+		plan.options.conditions.generationMatch = metadata.generation
+		plan.options.conditions.metagenerationMatch = metadata.metageneration
 	} else {
-		options.conditions.doesNotExist = true
+		plan.options.conditions.doesNotExist = true
 	}
 
-	return options, 0, nil
+	return plan, 0, nil
 }
 
 func writeOptionsFromRequest(req *http.Request) objectWriteOptions {

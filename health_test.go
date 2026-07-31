@@ -280,6 +280,48 @@ func TestReadinessCheckWaitHonorsContext(t *testing.T) {
 	}
 }
 
+func TestReadinessCheckDoesNotCacheCanceledOwner(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	var calls atomic.Int32
+	check := cacheReadinessCheck(
+		func(ctx context.Context) error {
+			if calls.Add(1) == 1 {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+
+			return nil
+		},
+		time.Second,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- check(ctx)
+	}()
+	<-started
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- check(context.Background())
+	}()
+
+	cancel()
+	if err := <-firstResult; !errors.Is(err, context.Canceled) {
+		t.Errorf("first check error = %v, want context canceled", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Errorf("second check error = %v, want nil", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+}
+
 func serveRequest(handler http.Handler, method, path string) *httptest.ResponseRecorder {
 	request := httptest.NewRequestWithContext(context.Background(), method, path, nil)
 	response := httptest.NewRecorder()

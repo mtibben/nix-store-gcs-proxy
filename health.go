@@ -112,11 +112,21 @@ func (c *readinessResultCache) run(ctx context.Context) error {
 		c.mu.Unlock()
 
 		result := c.check(ctx)
+		ctxErr := ctx.Err()
+		if result == nil && ctxErr != nil {
+			result = fmt.Errorf("run readiness check: %w", ctxErr)
+		}
 
 		c.mu.Lock()
-		c.result = result
-		c.hasResult = true
-		c.expiresAt = c.now().Add(c.ttl)
+		if ctxErr == nil {
+			c.result = result
+			c.hasResult = true
+			c.expiresAt = c.now().Add(c.ttl)
+		} else {
+			c.result = nil
+			c.hasResult = false
+			c.expiresAt = time.Time{}
+		}
 		close(c.inFlight)
 		c.inFlight = nil
 		c.mu.Unlock()

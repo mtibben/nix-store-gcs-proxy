@@ -72,6 +72,9 @@ func TestBucketProxySizesUploadBufferFromContentLength(t *testing.T) {
 	const content = "cache data"
 	writer := &bufferWriteCloser{}
 	store := &fakeObjectStore{
+		attributesFunc: func(context.Context, string) (objectMetadata, error) {
+			return objectMetadata{}, nil
+		},
 		newWriterFunc: func(
 			_ context.Context,
 			objectName string,
@@ -109,11 +112,70 @@ func TestBucketProxySizesUploadBufferFromContentLength(t *testing.T) {
 	}
 }
 
+func TestBucketProxyUsesPutCreationStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		objectExists bool
+		wantStatus   int
+	}{
+		"create": {
+			wantStatus: http.StatusCreated,
+		},
+		"replace": {
+			objectExists: true,
+			wantStatus:   http.StatusOK,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeObjectStore{
+				attributesFunc: func(context.Context, string) (objectMetadata, error) {
+					if !test.objectExists {
+						return objectMetadata{}, storage.ErrObjectNotExist
+					}
+
+					return objectMetadata{}, nil
+				},
+				newWriterFunc: func(
+					context.Context,
+					string,
+					objectWriteOptions,
+				) objectWriter {
+					return &trackingObjectWriter{}
+				},
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodPut,
+				"/example.nar",
+				strings.NewReader("cache data"),
+			)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Errorf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if response.Body.String() != "OK" {
+				t.Errorf("body = %q, want OK", response.Body.String())
+			}
+		})
+	}
+}
+
 func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 	t.Parallel()
 
 	writer := &trackingObjectWriter{}
 	store := &fakeObjectStore{
+		attributesFunc: func(context.Context, string) (objectMetadata, error) {
+			return objectMetadata{}, nil
+		},
 		newWriterFunc: func(
 			context.Context,
 			string,
@@ -213,7 +275,7 @@ func TestBucketProxyHonorsWritePreconditions(t *testing.T) {
 			headers: map[string]string{
 				"If-None-Match": "*",
 			},
-			wantStatus: http.StatusOK,
+			wantStatus: http.StatusCreated,
 			wantWrite:  true,
 			wantConditions: objectWriteConditions{
 				doesNotExist: true,
