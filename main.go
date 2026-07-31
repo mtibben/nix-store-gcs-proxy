@@ -29,6 +29,11 @@ type BucketProxy struct {
 	store objectStore
 }
 
+const (
+	gcsUploadChunkAlignment = 256 * 1024
+	gcsDefaultUploadChunk   = 16 * 1024 * 1024
+)
+
 func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	objectPath := req.URL.Path[1:]
 
@@ -174,7 +179,21 @@ func writeOptionsFromRequest(req *http.Request) objectWriteOptions {
 		contentEncoding:    req.Header.Get("Content-Encoding"),
 		contentDisposition: req.Header.Get("Content-Disposition"),
 		cacheControl:       req.Header.Get("Cache-Control"),
+		chunkSize:          uploadChunkSize(req.ContentLength),
 	}
+}
+
+func uploadChunkSize(contentLength int64) int {
+	if contentLength < 0 || contentLength >= gcsDefaultUploadChunk {
+		return gcsDefaultUploadChunk
+	}
+
+	sizeWithFinalByte := contentLength + 1
+	alignedSize := (sizeWithFinalByte + gcsUploadChunkAlignment - 1) /
+		gcsUploadChunkAlignment *
+		gcsUploadChunkAlignment
+
+	return int(alignedSize)
 }
 
 // Start the HTTP server
