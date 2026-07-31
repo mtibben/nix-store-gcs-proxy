@@ -45,9 +45,18 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
+		w.Header().Set("Accept-Ranges", "bytes")
 	case http.MethodGet:
-		object, err := s.store.newReader(ctx, objectPath)
+		object, partial, err := s.readObject(ctx, objectPath, req.Header.Get("Range"))
 		if err != nil {
+			if errors.Is(err, errRangeNotSatisfiable) {
+				if errors.Is(err, errInvalidByteRange) {
+					writeRangeNotSatisfiable(w, -1)
+				} else {
+					s.writeRangeError(w, ctx, objectPath)
+				}
+				return
+			}
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				http.Error(w, "File not found", http.StatusNotFound)
 			} else {
@@ -62,6 +71,13 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}()
 
 		setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
+		if !object.metadata.decompressed {
+			w.Header().Set("Accept-Ranges", "bytes")
+			if partial {
+				setPartialContentHeaders(w.Header(), object)
+				w.WriteHeader(http.StatusPartialContent)
+			}
+		}
 		if _, err := io.Copy(w, object.body); err != nil {
 			log.Println(err)
 		}
@@ -87,6 +103,44 @@ func (s BucketProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		msg := fmt.Sprintf("Method '%s' is not supported", req.Method)
 		http.Error(w, msg, http.StatusMethodNotAllowed)
 	}
+}
+
+func (s BucketProxy) readObject(
+	ctx context.Context,
+	objectPath, rangeHeader string,
+) (objectRead, bool, error) {
+	if rangeHeader == "" {
+		object, err := s.store.newReader(ctx, objectPath)
+		return object, false, err
+	}
+
+	byteRange, err := parseObjectByteRange(rangeHeader)
+	if err != nil {
+		return objectRead{}, false, err
+	}
+
+	object, err := s.store.newRangeReader(
+		ctx,
+		objectPath,
+		byteRange.offset,
+		byteRange.length,
+	)
+	return object, true, err
+}
+
+func (s BucketProxy) writeRangeError(
+	w http.ResponseWriter,
+	ctx context.Context,
+	objectPath string,
+) {
+	metadata, err := s.store.attributes(ctx, objectPath)
+	if err != nil {
+		log.Printf("Read object metadata after range failure: %v", err)
+		writeRangeNotSatisfiable(w, -1)
+		return
+	}
+
+	writeRangeNotSatisfiable(w, metadata.size)
 }
 
 func writeOptionsFromRequest(req *http.Request) objectWriteOptions {

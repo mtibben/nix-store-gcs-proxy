@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 )
 
 type objectMetadata struct {
@@ -98,6 +101,14 @@ func (s *gcsObjectStore) newRangeReader(
 ) (objectRead, error) {
 	reader, err := s.bucket.Object(objectName).NewRangeReader(ctx, offset, length)
 	if err != nil {
+		var apiErr *googleapi.Error
+		if errors.As(err, &apiErr) &&
+			apiErr.Code == http.StatusRequestedRangeNotSatisfiable {
+			return objectRead{}, errors.Join(
+				errRangeNotSatisfiable,
+				fmt.Errorf("open object %q range: %w", objectName, err),
+			)
+		}
 		return objectRead{}, fmt.Errorf("open object %q range: %w", objectName, err)
 	}
 

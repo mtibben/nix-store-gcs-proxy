@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +107,240 @@ func TestObjectHeadersOmitEncodingAfterGCSDecompression(t *testing.T) {
 	}
 }
 
+func TestBucketProxyServesByteRanges(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		rangeHeader string
+		wantOffset  int64
+		wantLength  int64
+		startOffset int64
+		body        string
+	}{
+		"closed": {
+			rangeHeader: "bytes=2-5",
+			wantOffset:  2,
+			wantLength:  4,
+			startOffset: 2,
+			body:        "2345",
+		},
+		"open ended": {
+			rangeHeader: "bytes=6-",
+			wantOffset:  6,
+			wantLength:  -1,
+			startOffset: 6,
+			body:        "6789",
+		},
+		"suffix": {
+			rangeHeader: "bytes=-3",
+			wantOffset:  -3,
+			wantLength:  -1,
+			startOffset: 7,
+			body:        "789",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeObjectStore{
+				newRangeReaderFunc: func(
+					_ context.Context,
+					_ string,
+					offset, length int64,
+				) (objectRead, error) {
+					if offset != test.wantOffset {
+						t.Errorf("offset = %d, want %d", offset, test.wantOffset)
+					}
+					if length != test.wantLength {
+						t.Errorf("length = %d, want %d", length, test.wantLength)
+					}
+
+					return objectRead{
+						body: io.NopCloser(strings.NewReader(test.body)),
+						metadata: objectMetadata{
+							size:           10,
+							contentType:    "application/octet-stream",
+							generation:     42,
+							metageneration: 3,
+						},
+						contentLength: int64(len(test.body)),
+						startOffset:   test.startOffset,
+					}, nil
+				},
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"/example.nar",
+				nil,
+			)
+			request.Header.Set("Range", test.rangeHeader)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != http.StatusPartialContent {
+				t.Errorf(
+					"status = %d, want %d",
+					response.Code,
+					http.StatusPartialContent,
+				)
+			}
+			if body := response.Body.String(); body != test.body {
+				t.Errorf("body = %q, want %q", body, test.body)
+			}
+			if contentLength := response.Header().Get("Content-Length"); contentLength !=
+				strconv.Itoa(len(test.body)) {
+				t.Errorf(
+					"Content-Length = %q, want %d",
+					contentLength,
+					len(test.body),
+				)
+			}
+			wantContentRange := fmt.Sprintf(
+				"bytes %d-%d/10",
+				test.startOffset,
+				test.startOffset+int64(len(test.body))-1,
+			)
+			if contentRange := response.Header().Get("Content-Range"); contentRange !=
+				wantContentRange {
+				t.Errorf("Content-Range = %q, want %q", contentRange, wantContentRange)
+			}
+			if acceptRanges := response.Header().Get("Accept-Ranges"); acceptRanges != "bytes" {
+				t.Errorf("Accept-Ranges = %q, want bytes", acceptRanges)
+			}
+		})
+	}
+}
+
+func TestBucketProxyRejectsInvalidByteRanges(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"items=0-1",
+		"bytes=1-0",
+		"bytes=0-1,3-4",
+		"bytes=-0",
+		"bytes=x-1",
+	}
+
+	for _, rangeHeader := range tests {
+		t.Run(rangeHeader, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeObjectStore{}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"/example.nar",
+				nil,
+			)
+			request.Header.Set("Range", rangeHeader)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			assertRangeNotSatisfiable(t, response, "")
+		})
+	}
+}
+
+func TestBucketProxyReportsUnsatisfiableGCSRange(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeObjectStore{
+		newRangeReaderFunc: func(
+			context.Context,
+			string,
+			int64,
+			int64,
+		) (objectRead, error) {
+			return objectRead{}, errRangeNotSatisfiable
+		},
+		attributesFunc: func(context.Context, string) (objectMetadata, error) {
+			return objectMetadata{size: 10}, nil
+		},
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"/example.nar",
+		nil,
+	)
+	request.Header.Set("Range", "bytes=20-")
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	assertRangeNotSatisfiable(t, response, "bytes */10")
+}
+
+func TestBucketProxyIgnoresRangeAfterGCSDecompression(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeObjectStore{
+		newRangeReaderFunc: func(
+			context.Context,
+			string,
+			int64,
+			int64,
+		) (objectRead, error) {
+			return objectRead{
+				body: io.NopCloser(strings.NewReader("cache data")),
+				metadata: objectMetadata{
+					size:         10,
+					decompressed: true,
+				},
+				contentLength: 10,
+			}, nil
+		},
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"/example.nar",
+		nil,
+	)
+	request.Header.Set("Range", "bytes=2-5")
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if contentRange := response.Header().Get("Content-Range"); contentRange != "" {
+		t.Errorf("Content-Range = %q, want empty", contentRange)
+	}
+	if acceptRanges := response.Header().Get("Accept-Ranges"); acceptRanges != "" {
+		t.Errorf("Accept-Ranges = %q, want empty", acceptRanges)
+	}
+}
+
+func assertRangeNotSatisfiable(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantContentRange string,
+) {
+	t.Helper()
+
+	if response.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf(
+			"status = %d, want %d",
+			response.Code,
+			http.StatusRequestedRangeNotSatisfiable,
+		)
+	}
+	if contentRange := response.Header().Get("Content-Range"); contentRange != wantContentRange {
+		t.Errorf("Content-Range = %q, want %q", contentRange, wantContentRange)
+	}
+	if acceptRanges := response.Header().Get("Accept-Ranges"); acceptRanges != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want bytes", acceptRanges)
+	}
+}
+
 func assertObjectHeaders(t *testing.T, header http.Header, modified time.Time) {
 	t.Helper()
 
@@ -115,6 +353,7 @@ func assertObjectHeaders(t *testing.T, header http.Header, modified time.Time) {
 		"Cache-Control":       "public, max-age=3600",
 		"Last-Modified":       modified.Format(http.TimeFormat),
 		"ETag":                `"gcs-42-3"`,
+		"Accept-Ranges":       "bytes",
 	}
 
 	for name, want := range expected {
@@ -178,3 +417,12 @@ func (s *fakeObjectStore) newWriter(
 }
 
 var _ objectStore = (*fakeObjectStore)(nil)
+
+func TestRangeErrorsUseSentinel(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseObjectByteRange("bytes=nope")
+	if !errors.Is(err, errRangeNotSatisfiable) {
+		t.Errorf("error = %v, want errRangeNotSatisfiable", err)
+	}
+}
