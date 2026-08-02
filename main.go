@@ -35,11 +35,6 @@ type BucketProxy struct {
 	store objectStore
 }
 
-type objectWritePlan struct {
-	options objectWriteOptions
-	created bool
-}
-
 type uploadResult struct {
 	size          int64
 	digest        []byte
@@ -86,9 +81,6 @@ func (s BucketProxy) serveHead(
 	}
 	setObjectResponseHeaders(w.Header(), metadata, metadata.size)
 	w.Header().Set("Accept-Ranges", "bytes")
-	if status := readPreconditionStatus(req, metadata); status != 0 {
-		writePreconditionResponse(w, status)
-	}
 }
 
 func (s BucketProxy) serveGet(
@@ -99,7 +91,7 @@ func (s BucketProxy) serveGet(
 	object, partial, err := s.readObject(req, objectPath)
 	if err != nil {
 		if errors.Is(err, errRangeNotSatisfiable) {
-			s.writeRangeError(w, req, objectPath)
+			s.writeRangeError(w, req.Context(), objectPath)
 			return
 		}
 		writeObjectReadError(w, err)
@@ -112,10 +104,6 @@ func (s BucketProxy) serveGet(
 	}()
 
 	setObjectResponseHeaders(w.Header(), object.metadata, object.contentLength)
-	if status := readPreconditionStatus(req, object.metadata); status != 0 {
-		writePreconditionResponse(w, status)
-		return
-	}
 	if !object.metadata.decompressed {
 		w.Header().Set("Accept-Ranges", "bytes")
 		if partial {
@@ -134,17 +122,8 @@ func (s BucketProxy) servePut(
 	objectPath string,
 ) {
 	ctx := req.Context()
-	plan, status, err := s.writePlanForRequest(req, objectPath)
-	if err != nil {
-		writeObjectReadError(w, err)
-		return
-	}
-	if status != 0 {
-		writePreconditionResponse(w, status)
-		return
-	}
-
-	writer := s.store.newWriter(ctx, objectPath, plan.options)
+	options := writeOptionsFromRequest(req)
+	writer := s.store.newWriter(ctx, objectPath, options)
 	upload, err := streamUpload(objectPath, writer, req.Body)
 	if err != nil {
 		writeObjectWriteError(w, err)
@@ -154,15 +133,13 @@ func (s BucketProxy) servePut(
 		want := uploadExpectation{
 			size:    upload.size,
 			digest:  upload.digest,
-			options: plan.options,
+			options: options,
 		}
 		s.writeExistingUploadResponse(w, ctx, objectPath, want)
 		return
 	}
 
-	if plan.created {
-		w.WriteHeader(http.StatusCreated)
-	}
+	w.WriteHeader(http.StatusCreated)
 	writeUploadSuccess(w)
 }
 
@@ -356,9 +333,7 @@ func objectMetadataMatchesWriteOptions(
 		metadata.cacheControl == options.cacheControl
 
 	return contentTypeMatches &&
-		metadata.contentLanguage == options.contentLanguage &&
 		metadata.contentEncoding == options.contentEncoding &&
-		metadata.contentDisposition == options.contentDisposition &&
 		cacheControlMatches
 }
 
@@ -374,78 +349,29 @@ func (s BucketProxy) readObject(
 ) (objectRead, bool, error) {
 	ctx := req.Context()
 	rangeHeader := req.Header.Get("Range")
-	if rangeHeader == "" {
+	if rangeHeader == "" || req.Header.Get("If-Range") != "" {
 		object, err := s.store.newReader(ctx, objectPath)
 		return object, false, err
 	}
 
-	byteRange, err := parseObjectByteRange(rangeHeader)
-	if err != nil {
-		if errors.Is(err, errRangeNotSupported) {
-			object, readErr := s.store.newReader(ctx, objectPath)
-			return object, false, readErr
-		}
-		return s.readAfterRangeFailure(req, objectPath, err)
+	offset, supported := parseNixResumeRange(rangeHeader)
+	if !supported {
+		object, err := s.store.newReader(ctx, objectPath)
+		return object, false, err
 	}
 
-	object, err := s.store.newRangeReader(ctx, objectPath, byteRange)
-	if err != nil {
-		return s.readAfterRangeFailure(req, objectPath, err)
-	}
-	ifRange := req.Header.Get("If-Range")
-	if ifRange == "" || ifRangeMatches(ifRange, object.metadata) {
-		return object, true, nil
-	}
-
-	if err := object.body.Close(); err != nil {
-		return objectRead{}, false, fmt.Errorf(
-			"close stale object %q range: %w",
-			objectPath,
-			err,
-		)
-	}
-
-	fullObject, err := s.store.newReader(ctx, objectPath)
-	return fullObject, false, err
-}
-
-func (s BucketProxy) readAfterRangeFailure(
-	req *http.Request,
-	objectPath string,
-	rangeErr error,
-) (objectRead, bool, error) {
-	ifRange := req.Header.Get("If-Range")
-	if ifRange == "" {
-		return objectRead{}, false, rangeErr
-	}
-
-	metadata, err := s.store.attributes(req.Context(), objectPath)
-	if err != nil {
-		return objectRead{}, false, err
-	}
-	if ifRangeMatches(ifRange, metadata) {
-		return objectRead{}, false, rangeErr
-	}
-
-	object, err := s.store.newReader(req.Context(), objectPath)
-	return object, false, err
+	object, err := s.store.newRangeReader(ctx, objectPath, offset)
+	return object, true, err
 }
 
 func (s BucketProxy) writeRangeError(
 	w http.ResponseWriter,
-	req *http.Request,
+	ctx context.Context,
 	objectPath string,
 ) {
-	metadata, err := s.store.attributes(req.Context(), objectPath)
+	metadata, err := s.store.attributes(ctx, objectPath)
 	if err != nil {
 		writeObjectReadError(w, err)
-		return
-	}
-
-	if status := readPreconditionStatus(req, metadata); status != 0 {
-		setObjectResponseHeaders(w.Header(), metadata, metadata.size)
-		w.Header().Set("Accept-Ranges", "bytes")
-		writePreconditionResponse(w, status)
 		return
 	}
 
@@ -462,61 +388,16 @@ func writeObjectReadError(w http.ResponseWriter, err error) {
 }
 
 func writeObjectWriteError(w http.ResponseWriter, err error) {
-	if errors.Is(err, errObjectPreconditionFailed) {
-		writePreconditionResponse(w, http.StatusPreconditionFailed)
-		return
-	}
-
 	log.Println(err)
 	http.Error(w, err.Error(), http.StatusBadGateway)
 }
 
-func (s BucketProxy) writePlanForRequest(
-	req *http.Request,
-	objectPath string,
-) (objectWritePlan, int, error) {
-	options := writeOptionsFromRequest(req)
-	metadata, err := s.store.attributes(req.Context(), objectPath)
-	exists := true
-	if errors.Is(err, storage.ErrObjectNotExist) {
-		exists = false
-		metadata = objectMetadata{}
-	} else if err != nil {
-		return objectWritePlan{}, 0, err
-	}
-
-	plan := objectWritePlan{
-		options: options,
-		created: !exists,
-	}
-	status, applied := writePreconditionStatus(req.Header, metadata, exists)
-	if status != 0 {
-		return plan, status, nil
-	}
-	if !applied {
-		plan.options.conditions.doesNotExist = true
-		plan.options.reuseExisting = true
-		return plan, 0, nil
-	}
-
-	if exists {
-		plan.options.conditions.generationMatch = metadata.generation
-		plan.options.conditions.metagenerationMatch = metadata.metageneration
-	} else {
-		plan.options.conditions.doesNotExist = true
-	}
-
-	return plan, 0, nil
-}
-
 func writeOptionsFromRequest(req *http.Request) objectWriteOptions {
 	return objectWriteOptions{
-		contentType:        req.Header.Get("Content-Type"),
-		contentLanguage:    req.Header.Get("Content-Language"),
-		contentEncoding:    req.Header.Get("Content-Encoding"),
-		contentDisposition: req.Header.Get("Content-Disposition"),
-		cacheControl:       req.Header.Get("Cache-Control"),
-		chunkSize:          uploadChunkSize(req.ContentLength),
+		contentType:     req.Header.Get("Content-Type"),
+		contentEncoding: req.Header.Get("Content-Encoding"),
+		cacheControl:    req.Header.Get("Cache-Control"),
+		chunkSize:       uploadChunkSize(req.ContentLength),
 	}
 }
 

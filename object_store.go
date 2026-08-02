@@ -6,24 +6,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
 )
 
 type objectMetadata struct {
-	size               int64
-	contentType        string
-	contentLanguage    string
-	contentEncoding    string
-	contentDisposition string
-	cacheControl       string
-	lastModified       time.Time
-	generation         int64
-	metageneration     int64
-	etag               string
-	decompressed       bool
+	size            int64
+	contentType     string
+	contentEncoding string
+	cacheControl    string
+	decompressed    bool
 }
 
 type objectRead struct {
@@ -34,34 +27,16 @@ type objectRead struct {
 }
 
 type objectWriteOptions struct {
-	contentType        string
-	contentLanguage    string
-	contentEncoding    string
-	contentDisposition string
-	cacheControl       string
-	chunkSize          int
-	conditions         objectWriteConditions
-	reuseExisting      bool
-}
-
-type objectWriteConditions struct {
-	doesNotExist        bool
-	generationMatch     int64
-	metagenerationMatch int64
-}
-
-func (c objectWriteConditions) toGCSConditions() storage.Conditions {
-	return storage.Conditions{
-		DoesNotExist:        c.doesNotExist,
-		GenerationMatch:     c.generationMatch,
-		MetagenerationMatch: c.metagenerationMatch,
-	}
+	contentType     string
+	contentEncoding string
+	cacheControl    string
+	chunkSize       int
 }
 
 type objectStore interface {
 	attributes(context.Context, string) (objectMetadata, error)
 	newReader(context.Context, string) (objectRead, error)
-	newRangeReader(context.Context, string, objectByteRange) (objectRead, error)
+	newRangeReader(context.Context, string, int64) (objectRead, error)
 	newWriter(context.Context, string, objectWriteOptions) objectWriter
 }
 
@@ -99,16 +74,10 @@ func (s *gcsObjectStore) attributes(
 
 func objectMetadataFromGCSAttrs(attrs *storage.ObjectAttrs) objectMetadata {
 	return objectMetadata{
-		size:               attrs.Size,
-		contentType:        attrs.ContentType,
-		contentLanguage:    attrs.ContentLanguage,
-		contentEncoding:    attrs.ContentEncoding,
-		contentDisposition: attrs.ContentDisposition,
-		cacheControl:       attrs.CacheControl,
-		lastModified:       attrs.Updated,
-		generation:         attrs.Generation,
-		metageneration:     attrs.Metageneration,
-		etag:               attrs.Etag,
+		size:            attrs.Size,
+		contentType:     attrs.ContentType,
+		contentEncoding: attrs.ContentEncoding,
+		cacheControl:    attrs.CacheControl,
 	}
 }
 
@@ -116,30 +85,24 @@ func (s *gcsObjectStore) newReader(
 	ctx context.Context,
 	objectName string,
 ) (objectRead, error) {
-	object, metadata, err := s.objectForRead(ctx, objectName)
-	if err != nil {
-		return objectRead{}, err
-	}
-
-	reader, err := object.NewReader(ctx)
+	reader, err := s.bucket.Object(objectName).ReadCompressed(true).NewReader(ctx)
 	if err != nil {
 		return objectRead{}, fmt.Errorf("open object %q: %w", objectName, err)
 	}
 
-	return objectReadFromGCSReader(reader, metadata), nil
+	return objectReadFromGCSReader(reader), nil
 }
 
 func (s *gcsObjectStore) newRangeReader(
 	ctx context.Context,
 	objectName string,
-	byteRange objectByteRange,
+	offset int64,
 ) (objectRead, error) {
-	object, metadata, err := s.objectForRead(ctx, objectName)
-	if err != nil {
-		return objectRead{}, err
-	}
-
-	reader, err := object.NewRangeReader(ctx, byteRange.offset, byteRange.length)
+	reader, err := s.bucket.Object(objectName).ReadCompressed(true).NewRangeReader(
+		ctx,
+		offset,
+		-1,
+	)
 	if err != nil {
 		var apiErr *googleapi.Error
 		if errors.As(err, &apiErr) &&
@@ -152,30 +115,7 @@ func (s *gcsObjectStore) newRangeReader(
 		return objectRead{}, fmt.Errorf("open object %q range: %w", objectName, err)
 	}
 
-	return objectReadFromGCSReader(reader, metadata), nil
-}
-
-func (s *gcsObjectStore) objectForRead(
-	ctx context.Context,
-	objectName string,
-) (*storage.ObjectHandle, objectMetadata, error) {
-	object := s.bucket.Object(objectName)
-	attrs, err := object.Attrs(ctx)
-	if err != nil {
-		return nil, objectMetadata{}, fmt.Errorf(
-			"read object %q metadata: %w",
-			objectName,
-			err,
-		)
-	}
-
-	metadata := objectMetadataFromGCSAttrs(attrs)
-	object = object.If(storage.Conditions{
-		GenerationMatch:     attrs.Generation,
-		MetagenerationMatch: attrs.Metageneration,
-	}).ReadCompressed(true)
-
-	return object, metadata, nil
+	return objectReadFromGCSReader(reader), nil
 }
 
 func (s *gcsObjectStore) newWriter(
@@ -184,62 +124,48 @@ func (s *gcsObjectStore) newWriter(
 	options objectWriteOptions,
 ) objectWriter {
 	writerContext, cancelWriter := context.WithCancel(ctx)
-	object := s.bucket.Object(objectName)
-	if options.conditions != (objectWriteConditions{}) {
-		object = object.If(options.conditions.toGCSConditions())
-	}
+	object := s.bucket.Object(objectName).If(storage.Conditions{DoesNotExist: true})
 	writer := object.NewWriter(writerContext)
 	writer.ContentType = options.contentType
-	writer.ContentLanguage = options.contentLanguage
 	writer.ContentEncoding = options.contentEncoding
-	writer.ContentDisposition = options.contentDisposition
 	writer.CacheControl = options.cacheControl
 	if options.chunkSize > 0 {
 		writer.ChunkSize = options.chunkSize
 	}
 
-	preconditionError := errObjectPreconditionFailed
-	if options.conditions.doesNotExist && options.reuseExisting {
-		preconditionError = errObjectAlreadyExists
-	}
-
 	return &gcsObjectWriter{
-		objectName:        objectName,
-		writer:            writer,
-		cancelWriter:      cancelWriter,
-		preconditionError: preconditionError,
+		objectName:   objectName,
+		writer:       writer,
+		cancelWriter: cancelWriter,
 	}
 }
 
-func objectReadFromGCSReader(
-	reader *storage.Reader,
-	metadata objectMetadata,
-) objectRead {
-	metadata.decompressed = reader.Attrs.Decompressed
-
+func objectReadFromGCSReader(reader *storage.Reader) objectRead {
 	return objectRead{
-		body:          reader,
-		metadata:      metadata,
+		body: reader,
+		metadata: objectMetadata{
+			size:            reader.Attrs.Size,
+			contentType:     reader.Attrs.ContentType,
+			contentEncoding: reader.Attrs.ContentEncoding,
+			cacheControl:    reader.Attrs.CacheControl,
+			decompressed:    reader.Attrs.Decompressed,
+		},
 		contentLength: reader.Remain(),
 		startOffset:   reader.Attrs.StartOffset,
 	}
 }
 
 type gcsObjectWriter struct {
-	objectName        string
-	writer            *storage.Writer
-	cancelWriter      context.CancelFunc
-	preconditionError error
+	objectName   string
+	writer       *storage.Writer
+	cancelWriter context.CancelFunc
 }
-
-var errObjectPreconditionFailed = errors.New("object precondition failed")
 
 func (w *gcsObjectWriter) Write(data []byte) (int, error) {
 	written, err := w.writer.Write(data)
 	if err != nil {
-		return written, classifyObjectWriteErrorAs(
+		return written, classifyObjectWriteError(
 			fmt.Errorf("write object %q: %w", w.objectName, err),
-			w.preconditionError,
 		)
 	}
 
@@ -250,9 +176,8 @@ func (w *gcsObjectWriter) Close() error {
 	defer w.cancelWriter()
 
 	if err := w.writer.Close(); err != nil {
-		return classifyObjectWriteErrorAs(
+		return classifyObjectWriteError(
 			fmt.Errorf("close object %q writer: %w", w.objectName, err),
-			w.preconditionError,
 		)
 	}
 
@@ -264,13 +189,9 @@ func (w *gcsObjectWriter) abort() {
 }
 
 func classifyObjectWriteError(err error) error {
-	return classifyObjectWriteErrorAs(err, errObjectPreconditionFailed)
-}
-
-func classifyObjectWriteErrorAs(err, preconditionError error) error {
 	var apiErr *googleapi.Error
 	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
-		return errors.Join(preconditionError, err)
+		return errors.Join(errObjectAlreadyExists, err)
 	}
 
 	return err

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add a Nix flake with a package, development shell, formatter, and checks.
 - Add golangci-lint checks for error handling, error wrapping, context
   propagation, and resource cleanup.
-- Add support for byte-range and conditional cache reads.
+- Add support for the open-ended byte-range form Nix uses to resume cache reads.
 
 ### Changed
 
@@ -23,8 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace Negroni with the standard library HTTP server.
 - Harden the HTTP server with timeouts, signal handling, graceful shutdown, and
   wrapped lifecycle errors.
-- Preserve complete GCS response metadata and validators while serving stored
-  object encodings consistently across `GET` and `HEAD`.
+- Serve stored content type, encoding, cache policy, and length consistently
+  across `GET` and `HEAD`.
+- Limit the HTTP interface to Nix's binary-cache protocol, omitting conditional
+  requests, response validators, and range forms that Nix does not use.
 - Reuse stream-copy buffers instead of allocating 32 KiB for every object.
 - Reduce memory used by concurrent small uploads while retaining resumable
   16 MiB chunks for large and unknown-size objects.
@@ -36,13 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Abort failed streaming uploads instead of finalizing partial GCS objects.
-- Evaluate read preconditions before reporting invalid or unsatisfiable ranges.
-- Enforce conditional `PUT` requests atomically with GCS object generations.
-- Return correctly framed empty responses when HTTP preconditions fail.
-- Treat byte-range units case-insensitively and ignore unsupported range requests.
+- Fall back to a full response for `Range` values other than Nix's open-ended
+  resume form.
 - Advertise the proxy's supported methods in `405 Method Not Allowed`
   responses.
-- Prevent date-based range resumes from combining different GCS generations.
 - Keep canceled readiness requests from affecting subsequent health probes.
 - Return `201 Created` when `PUT` creates a new cache object.
 

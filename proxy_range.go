@@ -3,120 +3,36 @@ package main
 import (
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
 var errRangeNotSatisfiable = errors.New("range not satisfiable")
-var errInvalidByteRange = fmt.Errorf("%w: invalid byte range", errRangeNotSatisfiable)
-var errRangeNotSupported = errors.New("range not supported")
 
-type objectByteRange struct {
-	offset int64
-	length int64
-}
-
-func parseObjectByteRange(value string) (objectByteRange, error) {
+func parseNixResumeRange(value string) (int64, bool) {
 	unit, value, ok := strings.Cut(value, "=")
-	if !ok {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: missing range unit separator",
-			errInvalidByteRange,
-		)
-	}
-	if !strings.EqualFold(unit, "bytes") {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: range unit %q",
-			errRangeNotSupported,
-			unit,
-		)
+	if !ok || !strings.EqualFold(unit, "bytes") {
+		return 0, false
 	}
 
 	value = strings.TrimSpace(value)
-	if strings.Contains(value, ",") {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: multiple byte ranges",
-			errRangeNotSupported,
-		)
-	}
-	if value == "" {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: exactly one byte range is required",
-			errInvalidByteRange,
-		)
-	}
-
 	startValue, endValue, ok := strings.Cut(value, "-")
-	if !ok {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: missing range separator",
-			errInvalidByteRange,
-		)
+	if !ok || strings.TrimSpace(endValue) != "" {
+		return 0, false
 	}
 
 	startValue = strings.TrimSpace(startValue)
-	endValue = strings.TrimSpace(endValue)
 	if startValue == "" {
-		return parseSuffixByteRange(endValue)
+		return 0, false
 	}
 
-	start, err := parseNonNegativeRangeNumber(startValue)
-	if err != nil {
-		return objectByteRange{}, err
-	}
-	if endValue == "" {
-		return objectByteRange{offset: start, length: -1}, nil
+	offset, err := strconv.ParseInt(startValue, 10, 64)
+	if err != nil || offset < 0 {
+		return 0, false
 	}
 
-	end, err := parseNonNegativeRangeNumber(endValue)
-	if err != nil {
-		return objectByteRange{}, err
-	}
-	if end < start || end-start == math.MaxInt64 {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: range end precedes range start",
-			errInvalidByteRange,
-		)
-	}
-
-	return objectByteRange{
-		offset: start,
-		length: end - start + 1,
-	}, nil
-}
-
-func parseSuffixByteRange(value string) (objectByteRange, error) {
-	length, err := parseNonNegativeRangeNumber(value)
-	if err != nil {
-		return objectByteRange{}, err
-	}
-	if length == 0 {
-		return objectByteRange{}, fmt.Errorf(
-			"%w: suffix length must be positive",
-			errInvalidByteRange,
-		)
-	}
-
-	return objectByteRange{offset: -length, length: -1}, nil
-}
-
-func parseNonNegativeRangeNumber(value string) (int64, error) {
-	if value == "" {
-		return 0, fmt.Errorf("%w: empty range value", errInvalidByteRange)
-	}
-
-	number, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || number < 0 {
-		return 0, fmt.Errorf(
-			"%w: invalid range value %q",
-			errInvalidByteRange,
-			value,
-		)
-	}
-
-	return number, nil
+	return offset, true
 }
 
 func setPartialContentHeaders(header http.Header, object objectRead) {

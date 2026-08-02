@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -27,86 +26,31 @@ func TestGCSObjectStorePreservesMetadataAndStoredEncoding(t *testing.T) {
 		objectName = "example.nar"
 		content    = "cache data"
 	)
-	modified := time.Date(2026, time.July, 31, 1, 2, 3, 0, time.UTC)
 	compressed := gzipContent(t, content)
-	var metadataRequests atomic.Int32
 	var downloadRequests atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		switch req.URL.Query().Get("alt") {
-		case "json":
-			metadataRequests.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, err := fmt.Fprintf(
-				w,
-				`{
-					"bucket": %q,
-					"name": %q,
-					"size": %q,
-					"contentType": "application/octet-stream",
-					"contentLanguage": "en",
-					"contentEncoding": "gzip",
-					"contentDisposition": "attachment",
-					"cacheControl": "public, max-age=3600",
-					"generation": "42",
-					"metageneration": "3",
-					"etag": "gcs-etag",
-					"updated": %q
-				}`,
-				bucketName,
-				objectName,
-				strconv.Itoa(len(compressed)),
-				modified.Format(time.RFC3339),
-			)
-			if err != nil {
-				t.Errorf("write metadata response: %v", err)
-			}
-		default:
-			if req.URL.Path != "/"+bucketName+"/"+objectName {
-				http.Error(w, "unexpected request", http.StatusBadRequest)
-				return
-			}
+		if req.URL.Path != "/"+bucketName+"/"+objectName {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
 
-			downloadRequests.Add(1)
-			if encoding := req.Header.Get("Accept-Encoding"); encoding != "gzip" {
-				t.Errorf("Accept-Encoding = %q, want gzip", encoding)
-			}
-			if generation := req.Header.Get("X-Goog-If-Generation-Match"); generation != "42" {
-				t.Errorf("X-Goog-If-Generation-Match = %q, want 42", generation)
-			}
-			if metageneration := req.Header.Get("X-Goog-If-Metageneration-Match"); metageneration != "3" {
-				t.Errorf("X-Goog-If-Metageneration-Match = %q, want 3", metageneration)
-			}
+		downloadRequests.Add(1)
+		if encoding := req.Header.Get("Accept-Encoding"); encoding != "gzip" {
+			t.Errorf("Accept-Encoding = %q, want gzip", encoding)
+		}
 
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Content-Length", strconv.Itoa(len(compressed)))
-			w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
-			w.Header().Set("X-Goog-Generation", "42")
-			w.Header().Set("X-Goog-Metageneration", "3")
-			if _, err := w.Write(compressed); err != nil {
-				t.Errorf("write object response: %v", err)
-			}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(compressed)))
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if _, err := w.Write(compressed); err != nil {
+			t.Errorf("write object response: %v", err)
 		}
 	}))
 	t.Cleanup(server.Close)
 
-	client, err := storage.NewClient(
-		context.Background(),
-		option.WithEndpoint(server.URL),
-		option.WithoutAuthentication(),
-		option.WithHTTPClient(server.Client()),
-	)
-	if err != nil {
-		t.Fatalf("create storage client: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := client.Close(); err != nil {
-			t.Errorf("close storage client: %v", err)
-		}
-	})
-
-	store := newGCSObjectStore(client.Bucket(bucketName))
+	store := newTestGCSObjectStore(t, server, bucketName)
 	object, err := store.newReader(context.Background(), objectName)
 	if err != nil {
 		t.Fatalf("open object: %v", err)
@@ -135,27 +79,134 @@ func TestGCSObjectStorePreservesMetadataAndStoredEncoding(t *testing.T) {
 		t.Error("object was transparently decompressed")
 	}
 
-	assertStoredObjectMetadata(t, object.metadata, int64(len(compressed)), modified)
-	if got := metadataRequests.Load(); got != 1 {
-		t.Errorf("metadata requests = %d, want 1", got)
-	}
+	assertStoredObjectMetadata(t, object.metadata, int64(len(compressed)))
 	if got := downloadRequests.Load(); got != 1 {
 		t.Errorf("download requests = %d, want 1", got)
 	}
 }
 
-func TestClassifyObjectWriteErrorMarksPreconditionFailures(t *testing.T) {
+func TestGCSObjectStoreUsesNixResumeRange(t *testing.T) {
 	t.Parallel()
 
-	apiErr := &googleapi.Error{Code: http.StatusPreconditionFailed}
-	wrapped := fmt.Errorf("close object writer: %w", apiErr)
-	err := classifyObjectWriteError(wrapped)
+	const (
+		bucketName = "cache"
+		objectName = "example.nar"
+	)
+	var downloadRequests atomic.Int32
 
-	if !errors.Is(err, errObjectPreconditionFailed) {
-		t.Errorf("error = %v, want errObjectPreconditionFailed", err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/"+bucketName+"/"+objectName {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+
+		downloadRequests.Add(1)
+		if encoding := req.Header.Get("Accept-Encoding"); encoding != "gzip" {
+			t.Errorf("Accept-Encoding = %q, want gzip", encoding)
+		}
+
+		switch byteRange := req.Header.Get("Range"); byteRange {
+		case "bytes=6-":
+			w.Header().Set("Content-Type", "application/x-nix-nar")
+			w.Header().Set("Content-Encoding", "zstd")
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 6-9/10")
+			w.WriteHeader(http.StatusPartialContent)
+			if _, err := io.WriteString(w, "6789"); err != nil {
+				t.Errorf("write range response: %v", err)
+			}
+		case "bytes=20-":
+			http.Error(
+				w,
+				http.StatusText(http.StatusRequestedRangeNotSatisfiable),
+				http.StatusRequestedRangeNotSatisfiable,
+			)
+		default:
+			http.Error(w, "unexpected range", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	store := newTestGCSObjectStore(t, server, bucketName)
+	object, err := store.newRangeReader(context.Background(), objectName, 6)
+	if err != nil {
+		t.Fatalf("open object range: %v", err)
 	}
-	if !errors.Is(err, apiErr) {
-		t.Errorf("error = %v, want wrapped API error", err)
+	body, readErr := io.ReadAll(object.body)
+	closeErr := object.body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatalf("read object range: %v", err)
+	}
+	if got := string(body); got != "6789" {
+		t.Errorf("body = %q, want 6789", got)
+	}
+	if object.metadata.size != 10 {
+		t.Errorf("size = %d, want 10", object.metadata.size)
+	}
+	if object.metadata.contentEncoding != "zstd" {
+		t.Errorf("content encoding = %q, want zstd", object.metadata.contentEncoding)
+	}
+	if object.startOffset != 6 {
+		t.Errorf("start offset = %d, want 6", object.startOffset)
+	}
+	if object.contentLength != 4 {
+		t.Errorf("content length = %d, want 4", object.contentLength)
+	}
+
+	_, err = store.newRangeReader(context.Background(), objectName, 20)
+	if !errors.Is(err, errRangeNotSatisfiable) {
+		t.Errorf("error = %v, want errRangeNotSatisfiable", err)
+	}
+	if got := downloadRequests.Load(); got != 2 {
+		t.Errorf("download requests = %d, want 2", got)
+	}
+}
+
+func TestGCSObjectStoreCreatesObjectsOnly(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bucketName = "cache"
+		objectName = "example.narinfo"
+	)
+	var uploadRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		uploadRequests.Add(1)
+		if req.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", req.Method)
+		}
+		if req.URL.Path != "/upload/storage/v1/b/"+bucketName+"/o" {
+			t.Errorf(
+				"path = %q, want /upload/storage/v1/b/%s/o",
+				req.URL.Path,
+				bucketName,
+			)
+		}
+		if got := req.URL.Query().Get("name"); got != objectName {
+			t.Errorf("object name = %q, want %q", got, objectName)
+		}
+		if got := req.URL.Query().Get("ifGenerationMatch"); got != "0" {
+			t.Errorf("ifGenerationMatch = %q, want 0", got)
+		}
+
+		http.Error(w, "object exists", http.StatusPreconditionFailed)
+	}))
+	t.Cleanup(server.Close)
+
+	store := newTestGCSObjectStore(t, server, bucketName)
+	writer := store.newWriter(
+		context.Background(),
+		objectName,
+		objectWriteOptions{contentType: "text/x-nix-narinfo"},
+	)
+	_, writeErr := writer.Write([]byte("cache data"))
+	closeErr := writer.Close()
+	if err := errors.Join(writeErr, closeErr); !errors.Is(err, errObjectAlreadyExists) {
+		t.Errorf("error = %v, want errObjectAlreadyExists", err)
+	}
+	if got := uploadRequests.Load(); got != 1 {
+		t.Errorf("upload requests = %d, want 1", got)
 	}
 }
 
@@ -164,51 +215,13 @@ func TestClassifyObjectWriteErrorMarksCreateOnlyConflicts(t *testing.T) {
 
 	apiErr := &googleapi.Error{Code: http.StatusPreconditionFailed}
 	wrapped := fmt.Errorf("close object writer: %w", apiErr)
-	err := classifyObjectWriteErrorAs(wrapped, errObjectAlreadyExists)
+	err := classifyObjectWriteError(wrapped)
 
 	if !errors.Is(err, errObjectAlreadyExists) {
 		t.Errorf("error = %v, want errObjectAlreadyExists", err)
 	}
 	if !errors.Is(err, apiErr) {
 		t.Errorf("error = %v, want wrapped API error", err)
-	}
-}
-
-func TestObjectWriteConditionsConvertToGCSConditions(t *testing.T) {
-	t.Parallel()
-
-	tests := map[string]struct {
-		conditions objectWriteConditions
-		want       storage.Conditions
-	}{
-		"existing generation": {
-			conditions: objectWriteConditions{
-				generationMatch:     42,
-				metagenerationMatch: 3,
-			},
-			want: storage.Conditions{
-				GenerationMatch:     42,
-				MetagenerationMatch: 3,
-			},
-		},
-		"object must not exist": {
-			conditions: objectWriteConditions{
-				doesNotExist: true,
-			},
-			want: storage.Conditions{
-				DoesNotExist: true,
-			},
-		},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := test.conditions.toGCSConditions(); got != test.want {
-				t.Errorf("GCS conditions = %+v, want %+v", got, test.want)
-			}
-		})
 	}
 }
 
@@ -231,7 +244,6 @@ func assertStoredObjectMetadata(
 	t *testing.T,
 	metadata objectMetadata,
 	size int64,
-	modified time.Time,
 ) {
 	t.Helper()
 
@@ -241,14 +253,8 @@ func assertStoredObjectMetadata(
 	if metadata.contentType != "application/octet-stream" {
 		t.Errorf("content type = %q, want application/octet-stream", metadata.contentType)
 	}
-	if metadata.contentLanguage != "en" {
-		t.Errorf("content language = %q, want en", metadata.contentLanguage)
-	}
 	if metadata.contentEncoding != "gzip" {
 		t.Errorf("content encoding = %q, want gzip", metadata.contentEncoding)
-	}
-	if metadata.contentDisposition != "attachment" {
-		t.Errorf("content disposition = %q, want attachment", metadata.contentDisposition)
 	}
 	if metadata.cacheControl != "public, max-age=3600" {
 		t.Errorf(
@@ -256,16 +262,29 @@ func assertStoredObjectMetadata(
 			metadata.cacheControl,
 		)
 	}
-	if !metadata.lastModified.Equal(modified) {
-		t.Errorf("last modified = %v, want %v", metadata.lastModified, modified)
+}
+
+func newTestGCSObjectStore(
+	t *testing.T,
+	server *httptest.Server,
+	bucketName string,
+) *gcsObjectStore {
+	t.Helper()
+
+	client, err := storage.NewClient(
+		context.Background(),
+		option.WithEndpoint(server.URL),
+		option.WithoutAuthentication(),
+		option.WithHTTPClient(server.Client()),
+	)
+	if err != nil {
+		t.Fatalf("create storage client: %v", err)
 	}
-	if metadata.generation != 42 {
-		t.Errorf("generation = %d, want 42", metadata.generation)
-	}
-	if metadata.metageneration != 3 {
-		t.Errorf("metageneration = %d, want 3", metadata.metageneration)
-	}
-	if metadata.etag != "gcs-etag" {
-		t.Errorf("etag = %q, want gcs-etag", metadata.etag)
-	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close storage client: %v", err)
+		}
+	})
+
+	return newGCSObjectStore(client.Bucket(bucketName))
 }

@@ -112,6 +112,31 @@ extra-trusted-public-keys = cache1.example.org:<public-key>
 Multi-user Nix installations may require a trusted user to change these
 settings.
 
+### HTTP compatibility
+
+This proxy implements the HTTP behavior used by Nix's binary-cache client,
+rather than acting as a general-purpose HTTP object server. It supports the
+open-ended byte range that Nix uses to resume interrupted downloads
+(`Range: bytes=<offset>-`). Bounded, suffix, and multipart ranges, `If-Range`,
+and conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`, and
+`If-Unmodified-Since`) are deliberately omitted because Nix's binary-cache
+client does not send them.
+
+`ETag` and `Last-Modified` are omitted because Nix does not use response
+validators to revalidate binary-cache objects. `Content-Language` and
+`Content-Disposition`, which Nix neither uploads nor consumes, are also
+omitted. The proxy preserves Nix's uploaded `Content-Type` and optional
+`Content-Encoding`, returns stored encodings for libcurl to decode, and supplies
+`Content-Length`, `Accept-Ranges`, and `Content-Range` for framing and resumed
+reads. `Cache-Control` remains a lightweight passthrough for intermediary
+caches. Uploads remain create-only and race-safe through a GCS
+object-nonexistence precondition: repeating an identical upload succeeds, while
+conflicting content returns `409 Conflict`.
+
+This compatibility boundary was audited against Nix 2.35.1's
+[HTTP binary-cache store](https://github.com/NixOS/nix/blob/2.35.1/src/libstore/http-binary-cache-store.cc)
+and [file-transfer implementation](https://github.com/NixOS/nix/blob/2.35.1/src/libstore/filetransfer.cc).
+
 ### Local performance
 
 The intended request path is a local Nix process through
@@ -120,12 +145,12 @@ connections. Adding local TLS solely to negotiate HTTP/2, or adding h2c support,
 would add complexity without reducing the upstream GCS latency.
 
 Object bodies stream directly between Nix and GCS without being staged on disk
-or buffered in full. Byte ranges and HTTP validators avoid unnecessary
-transfers when Nix resumes or revalidates a download. Uploads with a known small
-size use a correspondingly small GCS retry buffer; large or unknown-size
-uploads retain the SDK's 16 MiB resumable chunks. The proxy does not keep a
-second local object cache because successfully substituted paths already live
-in the local Nix store.
+or buffered in full. Open-ended byte ranges avoid retransferring data when Nix
+resumes an interrupted download. Uploads with a known small size use a
+correspondingly small GCS retry buffer; large or unknown-size uploads retain
+the SDK's 16 MiB resumable chunks. The proxy does not keep a second local object
+cache because successfully substituted paths already live in the local Nix
+store.
 
 ## Development
 
