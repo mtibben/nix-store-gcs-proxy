@@ -137,21 +137,6 @@ This compatibility boundary was audited against Nix 2.35.1's
 [HTTP binary-cache store](https://github.com/NixOS/nix/blob/2.35.1/src/libstore/http-binary-cache-store.cc)
 and [file-transfer implementation](https://github.com/NixOS/nix/blob/2.35.1/src/libstore/filetransfer.cc).
 
-### Local performance
-
-The intended request path is a local Nix process through
-`http://127.0.0.1:3000` to GCS. The loopback endpoint uses persistent HTTP/1.1
-connections. Adding local TLS solely to negotiate HTTP/2, or adding h2c support,
-would add complexity without reducing the upstream GCS latency.
-
-Object bodies stream directly between Nix and GCS without being staged on disk
-or buffered in full. Open-ended byte ranges avoid retransferring data when Nix
-resumes an interrupted download. Uploads with a known small size use a
-correspondingly small GCS retry buffer; large or unknown-size uploads retain
-the SDK's 16 MiB resumable chunks. The proxy does not keep a second local object
-cache because successfully substituted paths already live in the local Nix
-store.
-
 ## Development
 
 The Nix flake provides Go and golangci-lint:
@@ -173,15 +158,3 @@ nix flake check
 
 This work is licensed under the Apache License 2.0.
 See [LICENSE](LICENSE) for more details.
-
-## Sponsors
-
-This work has been sponsored by [Digital Asset](https://digitalasset.com) and [Tweag I/O](https://tweag.io).
-
-[![Digital Asset](https://avatars1.githubusercontent.com/u/9829909?s=200&v=4)](http://digitalasset.com)
-[![Tweag I/O](https://avatars1.githubusercontent.com/u/6057932?s=200&v=4)](https://tweag.io)
-
-This repository is maintained by [Tweag I/O](http://tweag.io)
-
-Have questions? Need help? Tweet at
-[@tweagio](http://twitter.com/tweagio).
