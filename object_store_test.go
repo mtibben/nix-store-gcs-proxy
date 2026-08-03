@@ -162,16 +162,23 @@ func TestGCSObjectStoreUsesNixResumeRange(t *testing.T) {
 	}
 }
 
-func TestGCSObjectStoreCreatesObjectsOnly(t *testing.T) {
+func TestGCSObjectStoreUsesNonexistenceConditionForNewObject(t *testing.T) {
 	t.Parallel()
 
 	const (
 		bucketName = "cache"
 		objectName = "example.narinfo"
 	)
+	var metadataRequests atomic.Int32
 	var uploadRequests atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			metadataRequests.Add(1)
+			http.Error(w, "object does not exist", http.StatusNotFound)
+			return
+		}
+
 		uploadRequests.Add(1)
 		if req.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", req.Method)
@@ -195,30 +202,202 @@ func TestGCSObjectStoreCreatesObjectsOnly(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	store := newTestGCSObjectStore(t, server, bucketName)
-	writer := store.newWriter(
+	write, err := store.newWriter(
 		context.Background(),
 		objectName,
 		objectWriteOptions{contentType: "text/x-nix-narinfo"},
 	)
-	_, writeErr := writer.Write([]byte("cache data"))
-	closeErr := writer.Close()
-	if err := errors.Join(writeErr, closeErr); !errors.Is(err, errObjectAlreadyExists) {
-		t.Errorf("error = %v, want errObjectAlreadyExists", err)
+	if err != nil {
+		t.Fatalf("prepare writer: %v", err)
+	}
+	if write.replacesExisting {
+		t.Error("new object writer unexpectedly replaces an existing generation")
+	}
+	_, writeErr := write.writer.Write([]byte("cache data"))
+	closeErr := write.writer.Close()
+	if err := errors.Join(writeErr, closeErr); !errors.Is(err, errObjectWritePreconditionFailed) {
+		t.Errorf("error = %v, want errObjectWritePreconditionFailed", err)
+	}
+	if got := metadataRequests.Load(); got != 1 {
+		t.Errorf("metadata requests = %d, want 1", got)
 	}
 	if got := uploadRequests.Load(); got != 1 {
 		t.Errorf("upload requests = %d, want 1", got)
 	}
 }
 
-func TestClassifyObjectWriteErrorMarksCreateOnlyConflicts(t *testing.T) {
+func TestGCSObjectStoreUsesGenerationConditionForExistingObject(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bucketName           = "cache"
+		objectName           = "example.narinfo"
+		objectGeneration     = "42"
+		objectMetageneration = "7"
+	)
+	var metadataRequests atomic.Int32
+	var uploadRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			metadataRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if _, err := fmt.Fprintf(
+				w,
+				`{"bucket":%q,"name":%q,"generation":%q,"metageneration":%q}`,
+				bucketName,
+				objectName,
+				objectGeneration,
+				objectMetageneration,
+			); err != nil {
+				t.Errorf("write metadata response: %v", err)
+			}
+			return
+		}
+
+		uploadRequests.Add(1)
+		if got := req.URL.Query().Get("ifGenerationMatch"); got != objectGeneration {
+			t.Errorf("ifGenerationMatch = %q, want %s", got, objectGeneration)
+		}
+		if got := req.URL.Query().Get("ifMetagenerationMatch"); got != objectMetageneration {
+			t.Errorf(
+				"ifMetagenerationMatch = %q, want %s",
+				got,
+				objectMetageneration,
+			)
+		}
+		http.Error(w, "generation changed", http.StatusPreconditionFailed)
+	}))
+	t.Cleanup(server.Close)
+
+	store := newTestGCSObjectStore(t, server, bucketName)
+	write, err := store.newWriter(
+		context.Background(),
+		objectName,
+		objectWriteOptions{contentType: "text/x-nix-narinfo"},
+	)
+	if err != nil {
+		t.Fatalf("prepare writer: %v", err)
+	}
+	if !write.replacesExisting {
+		t.Error("existing object writer does not replace the current generation")
+	}
+	_, writeErr := write.writer.Write([]byte("updated cache data"))
+	closeErr := write.writer.Close()
+	if err := errors.Join(writeErr, closeErr); !errors.Is(err, errObjectWritePreconditionFailed) {
+		t.Errorf("error = %v, want errObjectWritePreconditionFailed", err)
+	}
+	if got := metadataRequests.Load(); got != 1 {
+		t.Errorf("metadata requests = %d, want 1", got)
+	}
+	if got := uploadRequests.Load(); got != 1 {
+		t.Errorf("upload requests = %d, want 1", got)
+	}
+}
+
+func TestGCSObjectStoreRejectsInvalidExistingObjectVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		generation     string
+		metageneration string
+	}{
+		"generation": {
+			generation:     "0",
+			metageneration: "1",
+		},
+		"metageneration": {
+			generation:     "1",
+			metageneration: "0",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var uploadRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, req *http.Request) {
+					if req.Method != http.MethodGet {
+						uploadRequests.Add(1)
+						http.Error(w, "unexpected upload", http.StatusInternalServerError)
+						return
+					}
+
+					w.Header().Set("Content-Type", "application/json")
+					if _, err := fmt.Fprintf(
+						w,
+						`{"bucket":"cache","name":"example.narinfo","generation":%q,"metageneration":%q}`,
+						test.generation,
+						test.metageneration,
+					); err != nil {
+						t.Errorf("write metadata response: %v", err)
+					}
+				},
+			))
+			t.Cleanup(server.Close)
+
+			store := newTestGCSObjectStore(t, server, "cache")
+			_, err := store.newWriter(
+				context.Background(),
+				"example.narinfo",
+				objectWriteOptions{},
+			)
+			if !errors.Is(err, errInvalidObjectVersion) {
+				t.Errorf("error = %v, want errInvalidObjectVersion", err)
+			}
+			if got := uploadRequests.Load(); got != 0 {
+				t.Errorf("upload requests = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestGCSObjectStoreDoesNotTreatMetadataFailureAsMissing(t *testing.T) {
+	t.Parallel()
+
+	var metadataRequests atomic.Int32
+	var uploadRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			metadataRequests.Add(1)
+			http.Error(w, "metadata unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		uploadRequests.Add(1)
+		http.Error(w, "unexpected upload", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	store := newTestGCSObjectStore(t, server, "cache")
+	store.bucket = store.bucket.Retryer(storage.WithPolicy(storage.RetryNever))
+	_, err := store.newWriter(
+		context.Background(),
+		"example.narinfo",
+		objectWriteOptions{},
+	)
+	if err == nil {
+		t.Fatal("prepare writer unexpectedly succeeded")
+	}
+	if got := metadataRequests.Load(); got != 1 {
+		t.Errorf("metadata requests = %d, want 1", got)
+	}
+	if got := uploadRequests.Load(); got != 0 {
+		t.Errorf("upload requests = %d, want 0", got)
+	}
+}
+
+func TestClassifyObjectWriteErrorMarksPreconditionFailures(t *testing.T) {
 	t.Parallel()
 
 	apiErr := &googleapi.Error{Code: http.StatusPreconditionFailed}
 	wrapped := fmt.Errorf("close object writer: %w", apiErr)
 	err := classifyObjectWriteError(wrapped)
 
-	if !errors.Is(err, errObjectAlreadyExists) {
-		t.Errorf("error = %v, want errObjectAlreadyExists", err)
+	if !errors.Is(err, errObjectWritePreconditionFailed) {
+		t.Errorf("error = %v, want errObjectWritePreconditionFailed", err)
 	}
 	if !errors.Is(err, apiErr) {
 		t.Errorf("error = %v, want wrapped API error", err)

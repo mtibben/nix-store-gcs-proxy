@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+
+	"cloud.google.com/go/storage"
 )
 
 const (
@@ -17,12 +19,12 @@ const (
 	gcsDefaultUploadChunk   = 16 * 1024 * 1024
 )
 
-var errObjectContentConflict = errors.New("object already exists with different content")
+var errObjectWriteConflict = errors.New("object changed during upload")
 
 type uploadResult struct {
-	size          int64
-	digest        []byte
-	alreadyExists bool
+	size               int64
+	digest             []byte
+	preconditionFailed bool
 }
 
 type uploadExpectation struct {
@@ -38,24 +40,32 @@ func (s BucketProxy) servePut(
 ) {
 	ctx := req.Context()
 	options := writeOptionsFromRequest(req)
-	writer := s.store.newWriter(ctx, objectPath, options)
-	upload, err := streamUpload(objectPath, writer, req.Body)
+	write, err := s.store.newWriter(ctx, objectPath, options)
 	if err != nil {
 		writeObjectWriteError(w, err)
 		return
 	}
-	if upload.alreadyExists {
+
+	upload, err := streamUpload(objectPath, write.writer, req.Body)
+	if err != nil {
+		writeObjectWriteError(w, err)
+		return
+	}
+	if upload.preconditionFailed {
 		want := uploadExpectation{
 			size:    upload.size,
 			digest:  upload.digest,
 			options: options,
 		}
-		s.writeExistingUploadResponse(w, ctx, objectPath, want)
+		s.writePreconditionFailureResponse(w, ctx, objectPath, want)
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	writeUploadSuccess(w)
+	status := http.StatusCreated
+	if write.replacesExisting {
+		status = http.StatusOK
+	}
+	writeUploadSuccess(w, status)
 }
 
 func streamUpload(
@@ -93,7 +103,7 @@ func streamUpload(
 
 	uploadErr := fmt.Errorf("stream upload %q: %w", objectPath, copyErr)
 	uploadErr = errors.Join(uploadErr, wc.Close())
-	if !errors.Is(uploadErr, errObjectAlreadyExists) {
+	if !errors.Is(uploadErr, errObjectWritePreconditionFailed) {
 		return uploadResult{}, uploadErr
 	}
 
@@ -106,9 +116,9 @@ func streamUpload(
 	}
 
 	return uploadResult{
-		size:          digest.size,
-		digest:        digest.Sum(nil),
-		alreadyExists: true,
+		size:               digest.size,
+		digest:             digest.Sum(nil),
+		preconditionFailed: true,
 	}, nil
 }
 
@@ -120,8 +130,8 @@ func completedUploadResult(digest *sizedHash, closeErr error) (uploadResult, err
 	if closeErr == nil {
 		return result, nil
 	}
-	if errors.Is(closeErr, errObjectAlreadyExists) {
-		result.alreadyExists = true
+	if errors.Is(closeErr, errObjectWritePreconditionFailed) {
+		result.preconditionFailed = true
 		return result, nil
 	}
 
@@ -177,7 +187,7 @@ func (w *writeErrorRecorder) Write(data []byte) (int, error) {
 	return written, err
 }
 
-func (s BucketProxy) writeExistingUploadResponse(
+func (s BucketProxy) writePreconditionFailureResponse(
 	w http.ResponseWriter,
 	ctx context.Context,
 	objectPath string,
@@ -190,13 +200,15 @@ func (s BucketProxy) writeExistingUploadResponse(
 		return
 	}
 	if identical {
-		writeUploadSuccess(w)
+		writeUploadSuccess(w, http.StatusOK)
 		return
 	}
 
-	conflictErr := fmt.Errorf("%w: %q", errObjectContentConflict, objectPath)
+	conflictErr := fmt.Errorf("%w: %q", errObjectWriteConflict, objectPath)
 	log.Println(conflictErr)
-	http.Error(w, conflictErr.Error(), http.StatusConflict)
+	// Nix retries 5xx responses and restarts the upload source. A 409 would
+	// turn ordinary compare-and-swap contention into a permanent PUT failure.
+	http.Error(w, conflictErr.Error(), http.StatusServiceUnavailable)
 }
 
 func (s BucketProxy) objectMatches(
@@ -206,8 +218,11 @@ func (s BucketProxy) objectMatches(
 ) (bool, error) {
 	object, err := s.store.newReader(ctx, objectPath)
 	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return false, nil
+		}
 		return false, fmt.Errorf(
-			"read concurrently-created object %q: %w",
+			"read current object %q after write conflict: %w",
 			objectPath,
 			err,
 		)
@@ -218,14 +233,14 @@ func (s BucketProxy) objectMatches(
 	closeErr := object.body.Close()
 	if copyErr != nil {
 		return false, fmt.Errorf(
-			"hash concurrently-created object %q: %w",
+			"hash current object %q after write conflict: %w",
 			objectPath,
 			copyErr,
 		)
 	}
 	if closeErr != nil {
 		return false, fmt.Errorf(
-			"close concurrently-created object %q: %w",
+			"close current object %q after write conflict: %w",
 			objectPath,
 			closeErr,
 		)
@@ -252,7 +267,8 @@ func objectMetadataMatchesWriteOptions(
 		cacheControlMatches
 }
 
-func writeUploadSuccess(w http.ResponseWriter) {
+func writeUploadSuccess(w http.ResponseWriter, status int) {
+	w.WriteHeader(status)
 	if _, err := fmt.Fprint(w, "OK"); err != nil {
 		log.Println(err)
 	}

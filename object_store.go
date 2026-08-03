@@ -33,11 +33,16 @@ type objectWriteOptions struct {
 	chunkSize       int
 }
 
+type objectWrite struct {
+	writer           objectWriter
+	replacesExisting bool
+}
+
 type objectStore interface {
 	attributes(context.Context, string) (objectMetadata, error)
 	newReader(context.Context, string) (objectRead, error)
 	newRangeReader(context.Context, string, int64) (objectRead, error)
-	newWriter(context.Context, string, objectWriteOptions) objectWriter
+	newWriter(context.Context, string, objectWriteOptions) (objectWrite, error)
 }
 
 type objectWriter interface {
@@ -49,7 +54,10 @@ type gcsObjectStore struct {
 	bucket *storage.BucketHandle
 }
 
-var errObjectAlreadyExists = errors.New("object already exists")
+var (
+	errInvalidObjectVersion          = errors.New("object has invalid version metadata")
+	errObjectWritePreconditionFailed = errors.New("object write precondition failed")
+)
 
 var _ objectStore = (*gcsObjectStore)(nil)
 
@@ -119,9 +127,36 @@ func (s *gcsObjectStore) newWriter(
 	ctx context.Context,
 	objectName string,
 	options objectWriteOptions,
-) objectWriter {
+) (objectWrite, error) {
+	object := s.bucket.Object(objectName)
+	attrs, err := object.Attrs(ctx)
+	replacesExisting := false
+	switch {
+	case err == nil:
+		replacesExisting = true
+		if attrs.Generation <= 0 || attrs.Metageneration <= 0 {
+			return objectWrite{}, fmt.Errorf(
+				"prepare object %q writer: %w (generation %d, metageneration %d)",
+				objectName,
+				errInvalidObjectVersion,
+				attrs.Generation,
+				attrs.Metageneration,
+			)
+		}
+
+		// Match the version observed before consuming the request body so a
+		// concurrent content or metadata change cannot be overwritten.
+		object = object.If(storage.Conditions{
+			GenerationMatch:     attrs.Generation,
+			MetagenerationMatch: attrs.Metageneration,
+		})
+	case errors.Is(err, storage.ErrObjectNotExist):
+		object = object.If(storage.Conditions{DoesNotExist: true})
+	default:
+		return objectWrite{}, fmt.Errorf("prepare object %q writer: %w", objectName, err)
+	}
+
 	writerContext, cancelWriter := context.WithCancel(ctx)
-	object := s.bucket.Object(objectName).If(storage.Conditions{DoesNotExist: true})
 	writer := object.NewWriter(writerContext)
 	writer.ContentType = options.contentType
 	writer.ContentEncoding = options.contentEncoding
@@ -130,11 +165,14 @@ func (s *gcsObjectStore) newWriter(
 		writer.ChunkSize = options.chunkSize
 	}
 
-	return &gcsObjectWriter{
-		objectName:   objectName,
-		writer:       writer,
-		cancelWriter: cancelWriter,
-	}
+	return objectWrite{
+		writer: &gcsObjectWriter{
+			objectName:   objectName,
+			writer:       writer,
+			cancelWriter: cancelWriter,
+		},
+		replacesExisting: replacesExisting,
+	}, nil
 }
 
 func objectReadFromGCSReader(reader *storage.Reader) objectRead {
@@ -188,7 +226,7 @@ func (w *gcsObjectWriter) abort() {
 func classifyObjectWriteError(err error) error {
 	var apiErr *googleapi.Error
 	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
-		return errors.Join(errObjectAlreadyExists, err)
+		return errors.Join(errObjectWritePreconditionFailed, err)
 	}
 
 	return err

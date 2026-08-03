@@ -17,7 +17,8 @@ gcloud auth application-default login
 ```
 
 Alternatively, set `GOOGLE_APPLICATION_CREDENTIALS` to a service account
-credential file.
+credential file. The credential must be able to read, create, and replace
+objects in the bucket.
 
 ### Run the proxy
 
@@ -129,9 +130,12 @@ omitted. The proxy preserves Nix's uploaded `Content-Type` and optional
 `Content-Encoding`, returns stored encodings for libcurl to decode, and supplies
 `Content-Length`, `Accept-Ranges`, and `Content-Range` for framing and resumed
 reads. `Cache-Control` remains a lightweight passthrough for intermediary
-caches. Uploads remain create-only and race-safe through a GCS
-object-nonexistence precondition: repeating an identical upload succeeds, while
-conflicting content returns `409 Conflict`.
+caches. Uploads use GCS generation and metageneration preconditions: a new
+object is created only if it remains absent, while an existing object is
+replaced only if the version observed before streaming remains current. New
+objects return `201 Created`, successful replacements return `200 OK`, and a
+concurrent change returns a retryable `503 Service Unavailable` unless the
+winning object already matches the upload.
 
 This compatibility boundary was audited against Nix 2.35.1's
 [HTTP binary-cache store](https://github.com/NixOS/nix/blob/2.35.1/src/libstore/http-binary-cache-store.cc)

@@ -376,7 +376,7 @@ type fakeObjectStore struct {
 	attributesFunc     func(context.Context, string) (objectMetadata, error)
 	newReaderFunc      func(context.Context, string) (objectRead, error)
 	newRangeReaderFunc func(context.Context, string, int64) (objectRead, error)
-	newWriterFunc      func(context.Context, string, objectWriteOptions) objectWriter
+	newWriterFunc      func(context.Context, string, objectWriteOptions) (objectWrite, error)
 }
 
 func (s *fakeObjectStore) attributes(
@@ -417,7 +417,7 @@ func (s *fakeObjectStore) newWriter(
 	ctx context.Context,
 	objectName string,
 	options objectWriteOptions,
-) objectWriter {
+) (objectWrite, error) {
 	if s.newWriterFunc == nil {
 		panic("unexpected newWriter call")
 	}

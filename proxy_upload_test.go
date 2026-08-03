@@ -9,7 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"cloud.google.com/go/storage"
 )
+
+var errPrepareWriter = errors.New("prepare writer")
 
 func TestUploadChunkSize(t *testing.T) {
 	t.Parallel()
@@ -73,7 +77,7 @@ func TestBucketProxyUsesNixUploadHeadersAndContentLength(t *testing.T) {
 			_ context.Context,
 			objectName string,
 			options objectWriteOptions,
-		) objectWriter {
+		) (objectWrite, error) {
 			if objectName != "example.narinfo" {
 				t.Errorf("object name = %q, want example.narinfo", objectName)
 			}
@@ -91,7 +95,7 @@ func TestBucketProxyUsesNixUploadHeadersAndContentLength(t *testing.T) {
 				t.Errorf("content encoding = %q, want zstd", options.contentEncoding)
 			}
 
-			return writer
+			return objectWrite{writer: writer}, nil
 		},
 	}
 	request := httptest.NewRequestWithContext(
@@ -114,6 +118,87 @@ func TestBucketProxyUsesNixUploadHeadersAndContentLength(t *testing.T) {
 	}
 }
 
+func TestBucketProxyReturnsBadGatewayWhenWriterPreparationFails(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeObjectStore{
+		newWriterFunc: func(
+			context.Context,
+			string,
+			objectWriteOptions,
+		) (objectWrite, error) {
+			return objectWrite{}, errPrepareWriter
+		},
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.narinfo",
+		strings.NewReader("cache data"),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusBadGateway)
+	}
+	if !strings.Contains(response.Body.String(), errPrepareWriter.Error()) {
+		t.Errorf("body = %q, want writer preparation error", response.Body.String())
+	}
+}
+
+func TestBucketProxyReplacesExistingNixObjects(t *testing.T) {
+	t.Parallel()
+
+	for _, objectPath := range []string{
+		"example.narinfo",
+		"nar/example.nar.zst",
+	} {
+		t.Run(objectPath, func(t *testing.T) {
+			t.Parallel()
+
+			const content = "updated cache data"
+			writer := &bufferWriteCloser{}
+			store := &fakeObjectStore{
+				newWriterFunc: func(
+					_ context.Context,
+					objectName string,
+					_ objectWriteOptions,
+				) (objectWrite, error) {
+					if objectName != objectPath {
+						t.Errorf("object name = %q, want %q", objectName, objectPath)
+					}
+
+					return objectWrite{
+						writer:           writer,
+						replacesExisting: true,
+					}, nil
+				},
+			}
+			request := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodPut,
+				"/"+objectPath,
+				strings.NewReader(content),
+			)
+			response := httptest.NewRecorder()
+
+			BucketProxy{store: store}.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+			}
+			if body := response.Body.String(); body != "OK" {
+				t.Errorf("body = %q, want OK", body)
+			}
+			if writer.String() != content {
+				t.Errorf("uploaded body = %q, want %q", writer.String(), content)
+			}
+		})
+	}
+}
+
 func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 	t.Parallel()
 
@@ -123,8 +208,8 @@ func TestBucketProxyAbortsFailedUpload(t *testing.T) {
 			context.Context,
 			string,
 			objectWriteOptions,
-		) objectWriter {
-			return writer
+		) (objectWrite, error) {
+			return objectWrite{writer: writer}, nil
 		},
 	}
 	request := httptest.NewRequestWithContext(
@@ -155,7 +240,7 @@ func TestBucketProxyReusesIdenticalNixUpload(t *testing.T) {
 	t.Parallel()
 
 	const content = "cache data"
-	store := concurrentUploadStore(content)
+	store := preconditionFailedUploadStore(content)
 	store.newReaderFunc = func(context.Context, string) (objectRead, error) {
 		return objectRead{
 			body: io.NopCloser(strings.NewReader(content)),
@@ -194,7 +279,7 @@ func TestBucketProxyKeepsCollisionTargetStableWhileReadingBody(t *testing.T) {
 	key := contextKey{}
 	originalContext := context.WithValue(context.Background(), key, "original")
 	comparedContext := ""
-	store := concurrentUploadStore(content)
+	store := preconditionFailedUploadStore(content)
 	store.newReaderFunc = func(ctx context.Context, objectName string) (objectRead, error) {
 		comparedObject = objectName
 		contextValue, ok := ctx.Value(key).(string)
@@ -243,13 +328,13 @@ func TestBucketProxyReusesIdenticalConcurrentUploadAfterWriteFailure(t *testing.
 	writer := &writeFailingExistingObjectWriter{
 		bytesUntilFailure: gcsDefaultUploadChunk,
 	}
-	store := concurrentUploadStore(content)
+	store := preconditionFailedUploadStore(content)
 	store.newWriterFunc = func(
 		_ context.Context,
 		_ string,
 		_ objectWriteOptions,
-	) objectWriter {
-		return writer
+	) (objectWrite, error) {
+		return objectWrite{writer: writer}, nil
 	}
 	request := httptest.NewRequestWithContext(
 		context.Background(),
@@ -275,6 +360,56 @@ func TestBucketProxyReusesIdenticalConcurrentUploadAfterWriteFailure(t *testing.
 	}
 }
 
+func TestBucketProxyAcceptsIdenticalUploadAfterWritePreconditionFailure(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("x", 2*streamCopyBufferSize)
+	writer := &writePreconditionFailingObjectWriter{
+		bytesUntilFailure: streamCopyBufferSize / 2,
+	}
+	store := preconditionFailedUploadStore(content)
+	openCurrent := store.newReaderFunc
+	writerCalls := 0
+	readerCalls := 0
+	store.newWriterFunc = func(
+		_ context.Context,
+		_ string,
+		_ objectWriteOptions,
+	) (objectWrite, error) {
+		writerCalls++
+		return objectWrite{writer: writer}, nil
+	}
+	store.newReaderFunc = func(ctx context.Context, objectName string) (objectRead, error) {
+		readerCalls++
+		return openCurrent(ctx, objectName)
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader(content),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if !writer.closed {
+		t.Error("precondition-failing writer was not closed")
+	}
+	if writer.aborted {
+		t.Error("precondition-failing writer was aborted")
+	}
+	if writerCalls != 1 {
+		t.Errorf("writer calls = %d, want 1", writerCalls)
+	}
+	if readerCalls != 1 {
+		t.Errorf("current object reads = %d, want 1", readerCalls)
+	}
+}
+
 func TestBucketProxyDoesNotReuseUploadAfterSimultaneousReadAndWriteFailure(
 	t *testing.T,
 ) {
@@ -283,14 +418,14 @@ func TestBucketProxyDoesNotReuseUploadAfterSimultaneousReadAndWriteFailure(
 	const content = "partial"
 	writer := &writeFailingExistingObjectWriter{}
 	readerCalls := 0
-	store := concurrentUploadStore(content)
+	store := preconditionFailedUploadStore(content)
 	openExisting := store.newReaderFunc
 	store.newWriterFunc = func(
 		_ context.Context,
 		_ string,
 		_ objectWriteOptions,
-	) objectWriter {
-		return writer
+	) (objectWrite, error) {
+		return objectWrite{writer: writer}, nil
 	}
 	store.newReaderFunc = func(ctx context.Context, name string) (objectRead, error) {
 		readerCalls++
@@ -367,7 +502,7 @@ func TestStreamUploadAbortsAfterShortWriteWithoutError(t *testing.T) {
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Errorf("error = %v, want short write", err)
 	}
-	if result.size != 0 || len(result.digest) != 0 || result.alreadyExists {
+	if result.size != 0 || len(result.digest) != 0 || result.preconditionFailed {
 		t.Errorf("result = %+v, want empty result", result)
 	}
 	if !writer.aborted {
@@ -395,7 +530,7 @@ func TestStreamUploadReportsReadFailureWhileFinishingCollisionHash(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "finish hashing upload") {
 		t.Errorf("error = %q, want finish hashing context", err)
 	}
-	if result.size != 0 || len(result.digest) != 0 || result.alreadyExists {
+	if result.size != 0 || len(result.digest) != 0 || result.preconditionFailed {
 		t.Errorf("result = %+v, want empty result", result)
 	}
 	if !writer.closed {
@@ -406,10 +541,26 @@ func TestStreamUploadReportsReadFailureWhileFinishingCollisionHash(t *testing.T)
 	}
 }
 
-func TestBucketProxyRejectsDifferentConcurrentUpload(t *testing.T) {
+func TestBucketProxyMakesDifferentConcurrentUploadRetryable(t *testing.T) {
 	t.Parallel()
 
-	store := concurrentUploadStore("different cache data")
+	store := preconditionFailedUploadStore("different cache data")
+	openWriter := store.newWriterFunc
+	openCurrent := store.newReaderFunc
+	writerCalls := 0
+	readerCalls := 0
+	store.newWriterFunc = func(
+		ctx context.Context,
+		objectName string,
+		options objectWriteOptions,
+	) (objectWrite, error) {
+		writerCalls++
+		return openWriter(ctx, objectName, options)
+	}
+	store.newReaderFunc = func(ctx context.Context, objectName string) (objectRead, error) {
+		readerCalls++
+		return openCurrent(ctx, objectName)
+	}
 	request := httptest.NewRequestWithContext(
 		context.Background(),
 		http.MethodPut,
@@ -420,16 +571,22 @@ func TestBucketProxyRejectsDifferentConcurrentUpload(t *testing.T) {
 
 	BucketProxy{store: store}.ServeHTTP(response, request)
 
-	if response.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusConflict)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if writerCalls != 1 {
+		t.Errorf("writer calls = %d, want 1", writerCalls)
+	}
+	if readerCalls != 1 {
+		t.Errorf("current object reads = %d, want 1", readerCalls)
 	}
 }
 
-func TestBucketProxyRejectsConcurrentUploadWithDifferentMetadata(t *testing.T) {
+func TestBucketProxyMakesConcurrentMetadataChangeRetryable(t *testing.T) {
 	t.Parallel()
 
 	const content = "cache data"
-	store := concurrentUploadStore(content)
+	store := preconditionFailedUploadStore(content)
 	request := httptest.NewRequestWithContext(
 		context.Background(),
 		http.MethodPut,
@@ -441,8 +598,30 @@ func TestBucketProxyRejectsConcurrentUploadWithDifferentMetadata(t *testing.T) {
 
 	BucketProxy{store: store}.ServeHTTP(response, request)
 
-	if response.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusConflict)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestBucketProxyMakesConcurrentDeletionRetryable(t *testing.T) {
+	t.Parallel()
+
+	store := preconditionFailedUploadStore("")
+	store.newReaderFunc = func(context.Context, string) (objectRead, error) {
+		return objectRead{}, storage.ErrObjectNotExist
+	}
+	request := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		"/example.nar",
+		strings.NewReader("cache data"),
+	)
+	response := httptest.NewRecorder()
+
+	BucketProxy{store: store}.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
 	}
 }
 
@@ -531,14 +710,14 @@ func (w *shortWritingObjectWriter) abort() {
 	w.aborted = true
 }
 
-func concurrentUploadStore(existingContent string) *fakeObjectStore {
+func preconditionFailedUploadStore(existingContent string) *fakeObjectStore {
 	return &fakeObjectStore{
 		newWriterFunc: func(
 			_ context.Context,
 			_ string,
 			_ objectWriteOptions,
-		) objectWriter {
-			return &existingObjectWriter{}
+		) (objectWrite, error) {
+			return objectWrite{writer: &preconditionFailingObjectWriter{}}, nil
 		},
 		newReaderFunc: func(context.Context, string) (objectRead, error) {
 			return objectRead{
@@ -548,15 +727,15 @@ func concurrentUploadStore(existingContent string) *fakeObjectStore {
 	}
 }
 
-type existingObjectWriter struct {
+type preconditionFailingObjectWriter struct {
 	bytes.Buffer
 }
 
-func (*existingObjectWriter) Close() error {
-	return errObjectAlreadyExists
+func (*preconditionFailingObjectWriter) Close() error {
+	return errObjectWritePreconditionFailed
 }
 
-func (*existingObjectWriter) abort() {}
+func (*preconditionFailingObjectWriter) abort() {}
 
 var errUploadWrite = errors.New("upload write failed")
 
@@ -581,9 +760,37 @@ func (w *writeFailingExistingObjectWriter) Write(data []byte) (int, error) {
 
 func (w *writeFailingExistingObjectWriter) Close() error {
 	w.closed = true
-	return errObjectAlreadyExists
+	return errObjectWritePreconditionFailed
 }
 
 func (w *writeFailingExistingObjectWriter) abort() {
+	w.aborted = true
+}
+
+type writePreconditionFailingObjectWriter struct {
+	bytesUntilFailure int
+	closed            bool
+	aborted           bool
+}
+
+func (w *writePreconditionFailingObjectWriter) Write(data []byte) (int, error) {
+	if w.bytesUntilFailure == 0 {
+		return 0, errObjectWritePreconditionFailed
+	}
+
+	written := min(len(data), w.bytesUntilFailure)
+	w.bytesUntilFailure -= written
+	if written < len(data) {
+		return written, errObjectWritePreconditionFailed
+	}
+	return written, nil
+}
+
+func (w *writePreconditionFailingObjectWriter) Close() error {
+	w.closed = true
+	return nil
+}
+
+func (w *writePreconditionFailingObjectWriter) abort() {
 	w.aborted = true
 }

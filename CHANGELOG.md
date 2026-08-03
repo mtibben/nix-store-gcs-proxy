@@ -43,9 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Advertise the proxy's supported methods in `405 Method Not Allowed`
   responses.
 - Keep canceled readiness requests from affecting subsequent health probes.
-- Make cache uploads create-only and idempotent: return `201 Created` for a new
-  object, return `200 OK` for an identical existing object, and return
-  `409 Conflict` when existing content or requested metadata differs.
+- Support Nix cache upserts, including narinfo signature updates and NAR repair,
+  with version-conditional GCS replacements. Return `201 Created` for a new
+  object, `200 OK` for a successful replacement or identical concurrent write,
+  and a retryable `503 Service Unavailable` when a concurrent change wins.
 
 ## [0.1.0] - 2019-09-04
 
