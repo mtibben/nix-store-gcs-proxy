@@ -13,15 +13,21 @@ linters:
     - errname
     - errorlint
     - fatcontext
+    - gocritic
     - gosec
+    - makezero
     - nilerr
     - nilnesserr
+    - nilnil
     - noctx
     - nolintlint
+    - predeclared
+    - recvcheck
     - rowserrcheck
     - sqlclosecheck
     - thelper
     - tparallel
+    - unconvert
     - wastedassign
     - wrapcheck
   settings:
