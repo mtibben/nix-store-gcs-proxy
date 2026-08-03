@@ -49,10 +49,7 @@ type gcsObjectStore struct {
 	bucket *storage.BucketHandle
 }
 
-var (
-	errObjectAlreadyExists   = errors.New("object already exists")
-	errObjectContentConflict = errors.New("object already exists with different content")
-)
+var errObjectAlreadyExists = errors.New("object already exists")
 
 var _ objectStore = (*gcsObjectStore)(nil)
 
